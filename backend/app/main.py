@@ -6,12 +6,14 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .config import AppConfig
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = ROOT / "config" / "default.yaml"
 RUN_META = ROOT / "data" / "processed" / "run_metadata.json"
+HPC_GEOJSON = ROOT / "data" / "processed" / "hpc_sites.geojson"
 
 app = FastAPI(title="HPC Map API", version="0.1.0")
 app.add_middleware(
@@ -57,4 +59,12 @@ def layer_status() -> dict:
     return {
         "distance_mbtiles_exists": distance_mbtiles.exists(),
         "hpc_mbtiles_exists": hpc_mbtiles.exists(),
+        "hpc_geojson_exists": HPC_GEOJSON.exists(),
     }
+
+
+@app.get("/layers/hpc-sites.geojson")
+def hpc_sites_geojson():
+    if not HPC_GEOJSON.exists():
+        return JSONResponse(status_code=404, content={"error": "missing hpc sites layer"})
+    return JSONResponse(content=json.loads(HPC_GEOJSON.read_text(encoding="utf-8")))

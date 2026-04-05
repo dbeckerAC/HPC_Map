@@ -130,7 +130,7 @@ Open `http://localhost:5173`.
 - Motorway extraction uses Overpass bbox queries (internally tiled for reliability), then geometries are clipped to Germany polygon before sampling.
 - Overpass cache refresh requires confirmation when older than 90 days (config-driven).
 - An HPC stations layer (`hpc_sites`) is generated from CSV-filtered chargers.
-- Frontend is vector-tile only at runtime (MBTiles via tileserver).
+- Frontend uses vector tiles for distance lines and clustered GeoJSON for HPC stations.
 
 ## Render.com Deployment
 

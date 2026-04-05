@@ -8,6 +8,7 @@ COPY pyproject.toml /app/pyproject.toml
 COPY backend /app/backend
 COPY pipeline /app/pipeline
 COPY config /app/config
+COPY data/processed /app/data/processed
 
 RUN pip install --no-cache-dir fastapi uvicorn pydantic PyYAML requests numpy scikit-learn shapely
 
