@@ -130,7 +130,7 @@ Open `http://localhost:5173`.
 - Motorway extraction uses Overpass bbox queries (internally tiled for reliability), then geometries are clipped to Germany polygon before sampling.
 - Overpass cache refresh requires confirmation when older than 90 days (config-driven).
 - An HPC stations layer (`hpc_sites`) is generated from CSV-filtered chargers.
-- Frontend prefers vector tiles (MBTiles via tileserver). If MBTiles are missing, it falls back to GeoJSON served by the API.
+- Frontend is vector-tile only at runtime (MBTiles via tileserver).
 
 ## Render.com Deployment
 
@@ -155,7 +155,6 @@ git push
 3. In Render, create a new **Blueprint** from your GitHub repo (uses `render.yaml`).
 
 4. If service names differ, adjust in `render.yaml`:
-- `VITE_API_BASE`
 - `VITE_TILESERVER_BASE`
 
 to your actual Render service URLs if names differ.

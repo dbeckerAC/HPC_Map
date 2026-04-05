@@ -1,9 +1,7 @@
 import maplibregl from "maplibre-gl";
 import "./styles.css";
 
-const API_BASE = (import.meta.env.VITE_API_BASE || "http://localhost:8000").replace(/\/$/, "");
 const TILESERVER_BASE = (import.meta.env.VITE_TILESERVER_BASE || "http://localhost:8080").replace(/\/$/, "");
-const FORCE_VECTOR = String(import.meta.env.VITE_FORCE_VECTOR || "").toLowerCase() === "true";
 const DISTANCE_TILES = `${TILESERVER_BASE}/data/hpc_distance/{z}/{x}/{y}.pbf`;
 const HPC_TILES = `${TILESERVER_BASE}/data/hpc_sites/{z}/{x}/{y}.pbf`;
 const hoverEl = document.getElementById("hover");
@@ -38,28 +36,6 @@ const map = new maplibregl.Map({
     ]
   }
 });
-
-async function getLayerMode() {
-  if (FORCE_VECTOR) {
-    return "vector";
-  }
-  try {
-    const response = await fetch(`${API_BASE}/layers/status`);
-    if (!response.ok) {
-      return "geojson";
-    }
-    const status = await response.json();
-    if (status.distance_mbtiles_exists) {
-      return "vector";
-    }
-    if (status.distance_geojson_exists) {
-      return "geojson";
-    }
-  } catch {
-    return "geojson";
-  }
-  return "geojson";
-}
 
 function addDistanceLayer(source, sourceLayer = null) {
   const casing = {
@@ -114,90 +90,31 @@ function addDistanceLayer(source, sourceLayer = null) {
 }
 
 function addHpcLayer(source, sourceLayer = null) {
-  const clusters = {
-    id: "hpc-clusters",
-    type: "circle",
-    source,
-    filter: ["has", "point_count"],
-    paint: {
-      "circle-color": "#0b57d0",
-      "circle-opacity": 0.82,
-      "circle-stroke-color": "#ffffff",
-      "circle-stroke-width": 1.0,
-      "circle-radius": [
-        "interpolate",
-        ["linear"],
-        ["get", "point_count"],
-        10,
-        12,
-        50,
-        17,
-        200,
-        22,
-        1000,
-        28
-      ]
-    }
-  };
-  const clusterCount = {
-    id: "hpc-cluster-count",
-    type: "symbol",
-    source,
-    filter: ["has", "point_count"],
-    layout: {
-      "text-field": ["to-string", ["get", "point_count_abbreviated"]],
-      "text-size": 11
-    },
-    paint: {
-      "text-color": "#ffffff"
-    }
-  };
   const points = {
     id: "hpc-sites",
     type: "circle",
     source,
-    filter: ["!", ["has", "point_count"]],
-    minzoom: 9,
+    minzoom: 5.5,
     paint: {
-      "circle-radius": ["interpolate", ["linear"], ["zoom"], 9, 2.0, 12, 4.5],
+      "circle-radius": ["interpolate", ["linear"], ["zoom"], 6, 1.6, 10, 2.8, 13, 4.4],
       "circle-color": "#1155cc",
-      "circle-opacity": 0.88,
+      "circle-opacity": 0.84,
       "circle-stroke-color": "#ffffff",
-      "circle-stroke-width": 0.9
+      "circle-stroke-width": 0.7
     }
   };
   if (sourceLayer) {
-    clusters["source-layer"] = sourceLayer;
-    clusterCount["source-layer"] = sourceLayer;
     points["source-layer"] = sourceLayer;
   }
-  map.addLayer(clusters);
-  map.addLayer(clusterCount);
   map.addLayer(points);
 }
 
-map.on("load", async () => {
-  const mode = await getLayerMode();
-  if (mode === "vector") {
-    map.addSource("distance", { type: "vector", tiles: [DISTANCE_TILES], minzoom: 4, maxzoom: 22 });
-    map.addSource("hpc", { type: "vector", tiles: [HPC_TILES], minzoom: 4, maxzoom: 22 });
-    addDistanceLayer("distance", "hpc_distance");
-    addHpcLayer("hpc", "hpc_sites");
-    hoverEl.textContent = "Hover a motorway segment";
-    bindHoverEvents();
-    return;
-  }
-  map.addSource("distance", { type: "geojson", data: `${API_BASE}/layers/hpc-distance.geojson` });
-  map.addSource("hpc", {
-    type: "geojson",
-    data: `${API_BASE}/layers/hpc-sites.geojson`,
-    cluster: true,
-    clusterRadius: 42,
-    clusterMaxZoom: 8
-  });
-  addDistanceLayer("distance");
-  addHpcLayer("hpc");
-  hoverEl.textContent = "Hover a motorway segment (GeoJSON mode)";
+map.on("load", () => {
+  map.addSource("distance", { type: "vector", tiles: [DISTANCE_TILES], minzoom: 4, maxzoom: 22 });
+  map.addSource("hpc", { type: "vector", tiles: [HPC_TILES], minzoom: 4, maxzoom: 22 });
+  addDistanceLayer("distance", "hpc_distance");
+  addHpcLayer("hpc", "hpc_sites");
+  hoverEl.textContent = "Hover a motorway segment";
   bindHoverEvents();
 });
 
@@ -220,10 +137,6 @@ function bindHoverEvents() {
     map.getCanvas().style.cursor = "pointer";
   });
 
-  map.on("mouseenter", "hpc-clusters", () => {
-    map.getCanvas().style.cursor = "pointer";
-  });
-
   map.on("mousemove", "hpc-sites", (event) => {
     const feature = event.features?.[0];
     if (!feature) return;
@@ -239,22 +152,10 @@ function bindHoverEvents() {
     hoverEl.textContent = "Hover a motorway segment";
   });
 
-  map.on("mousemove", "hpc-clusters", (event) => {
-    const feature = event.features?.[0];
-    if (!feature) return;
-    const count = feature.properties?.point_count_abbreviated ?? feature.properties?.point_count ?? "n/a";
-    hoverEl.textContent = `HPC cluster: ${count} stations`;
-  });
-
-  map.on("mouseleave", "hpc-clusters", () => {
-    map.getCanvas().style.cursor = "";
-    hoverEl.textContent = "Hover a motorway segment";
-  });
-
   if (hpcToggle) {
     hpcToggle.addEventListener("change", () => {
       const visibility = hpcToggle.checked ? "visible" : "none";
-      for (const layerId of ["hpc-clusters", "hpc-cluster-count", "hpc-sites"]) {
+      for (const layerId of ["hpc-sites"]) {
         if (map.getLayer(layerId)) {
           map.setLayoutProperty(layerId, "visibility", visibility);
         }

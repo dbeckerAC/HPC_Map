@@ -95,17 +95,16 @@ The app must avoid loading large raw point datasets in the browser and must use 
 - Geometry: points
 - Source: filtered chargers above configurable threshold
 - Purpose: additional effective-layer pattern for map stack and hover inspection
-- UI: visible as point layer; hover shows charger id, power, and status
+- UI: visible as point layer; hover shows charger id, power, operator, and status
 
 ## Frontend Behavior
 
 - Render base map and precomputed distance layer.
 - Do not render raw sampled point set.
 - Hover on distance segments displays value in km and active minimum power threshold.
-- Show clustered HPC sites layer by default with a checkbox to hide/show stations.
+- Show HPC sites as point layer by default with a checkbox to hide/show stations.
 - Layer loading mode:
-  - preferred: vector tiles from MBTiles
-  - fallback: GeoJSON from API endpoints when MBTiles are not available
+  - vector tiles from MBTiles only
 
 ## Performance Rules
 
