@@ -1,0 +1,81 @@
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: hpc-frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5173"]
+    depends_on:
+      - api
+      - tileserver
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: hpc-pipeline
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+    command: ["python", "-m", "pipeline.run_pipeline", "--config", "config/default.yaml", "--fresh"]
+
+  graphhopper:
+    image: eclipse-temurin:21-jre
+    container_name: hpc-graphhopper
+    environment:
+      JAVA_OPTS: "-Xms1g -Xmx6g -XX:+UseG1GC"
+    ports:
+      - "8989:8989"
+    volumes:
+      - ./tools/graphhopper:/graphhopper
+      - ./data/raw/osm:/osm:ro
+      - ./config/graphhopper.yml:/config/graphhopper.yml:ro
+    command:
+      - /bin/sh
+      - -lc
+      - >
+        set -eu;
+        GH_JAR="/graphhopper/current.jar";
+        if [ ! -f "$$GH_JAR" ]; then
+          set -- /graphhopper/graphhopper-web-*.jar;
+          if [ "$$1" = "/graphhopper/graphhopper-web-*.jar" ]; then
+            echo "GraphHopper jar not found in ./tools/graphhopper";
+            exit 1;
+          fi;
+          GH_JAR="$$1";
+        fi;
+        if [ ! -f /osm/germany-latest.osm.pbf ]; then
+          echo "PBF missing: ./data/raw/osm/germany-latest.osm.pbf";
+          exit 1;
+        fi;
+        if [ ! -f /graphhopper/.import-complete ]; then
+          rm -rf /graphhopper/graph-cache;
+          java $$JAVA_OPTS -Ddw.graphhopper.datareader.file=/osm/germany-latest.osm.pbf -jar "$$GH_JAR" import /config/graphhopper.yml;
+          touch /graphhopper/.import-complete;
+        fi;
+        exec java $$JAVA_OPTS -Ddw.graphhopper.datareader.file=/osm/germany-latest.osm.pbf -jar "$$GH_JAR" server /config/graphhopper.yml;
+
+  tileserver:
+    image: maptiler/tileserver-gl-light:latest
+    container_name: hpc-tileserver
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data/processed:/data
+    command: ["--port", "8080"]
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: hpc-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data

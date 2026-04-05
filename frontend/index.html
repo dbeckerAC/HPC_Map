@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HPC Map</title>
+    <script type="module" src="/src/main.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <aside id="panel">
+        <h1>HPC Distance Map</h1>
+        <p>Distance to nearest eligible HPC</p>
+        <div id="legend">
+          <div class="legend-title">Distance Legend (km)</div>
+          <div class="legend-bar"></div>
+          <div class="legend-scale">
+            <span>0 (near)</span>
+            <span>20+ (far)</span>
+          </div>
+        </div>
+        <label id="hpc-toggle-row">
+          <input id="hpc-toggle" type="checkbox" checked />
+          <span>Show charging stations</span>
+        </label>
+        <div id="hover">Hover a motorway segment</div>
+      </aside>
+      <div id="map"></div>
+    </div>
+  </body>
+</html>

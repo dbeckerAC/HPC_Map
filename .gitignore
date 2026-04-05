@@ -1,0 +1,15 @@
+data/intermediate/
+data/processed/
+data/cache/
+infra/valhalla/tiles/
+infra/valhalla/cache/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+.pycache/
+.pytest_cache/
+.DS_Store
+tools/graphhopper/
+data/raw/osm/
+.venv/
+hpc_map.egg-info/

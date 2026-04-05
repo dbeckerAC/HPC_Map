@@ -1,0 +1,15 @@
+.git
+.gitignore
+.venv
+frontend/node_modules
+frontend/dist
+tools/graphhopper
+data/raw
+data/cache
+data/intermediate
+data/processed
+__pycache__
+*.mbtiles
+*.log
+.DS_Store
+
