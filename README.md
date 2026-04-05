@@ -144,6 +144,8 @@ Prerequisites:
 ./deploy/prepare_render_assets.sh
 ```
 
+This also stages `hpc_sites.geojson` for the Render API image at `deploy/render/api-data/`.
+
 2. Commit and push to GitHub:
 
 ```bash

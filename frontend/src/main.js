@@ -153,6 +153,9 @@ function addHpcLayer(source, sourceLayer = null) {
 }
 
 map.on("load", () => {
+  if (hpcToggle) {
+    hpcToggle.checked = false;
+  }
   map.addSource("distance", { type: "vector", tiles: [DISTANCE_TILES], minzoom: 4, maxzoom: 22 });
   map.addSource("hpc", {
     type: "geojson",
