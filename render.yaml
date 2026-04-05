@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: hpc-map-api
+    env: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: .
+    plan: starter
+    autoDeploy: true
+
+  - type: web
+    name: hpc-map-tileserver
+    env: docker
+    dockerfilePath: ./deploy/render/tileserver/Dockerfile
+    dockerContext: ./deploy/render/tileserver
+    plan: starter
+    autoDeploy: true
+
+  - type: web
+    name: hpc-map-frontend
+    env: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE
+        value: https://hpc-map-api.onrender.com
+      - key: VITE_TILESERVER_BASE
+        value: https://hpc-map-tileserver.onrender.com

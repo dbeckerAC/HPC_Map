@@ -131,3 +131,35 @@ Open `http://localhost:5173`.
 - Overpass cache refresh requires confirmation when older than 90 days (config-driven).
 - An HPC stations layer (`hpc_sites`) is generated from CSV-filtered chargers.
 - Frontend prefers vector tiles (MBTiles via tileserver). If MBTiles are missing, it falls back to GeoJSON served by the API.
+
+## Render.com Deployment
+
+Prerequisites:
+- pipeline already finished
+- `data/processed/hpc_distance.mbtiles` and `data/processed/hpc_sites.mbtiles` exist
+
+1. Stage MBTiles for Render tileserver image:
+
+```bash
+./deploy/prepare_render_assets.sh
+```
+
+2. Commit and push to GitHub:
+
+```bash
+git add render.yaml deploy/render deploy/prepare_render_assets.sh frontend/src/main.js README.md
+git commit -m "Prepare Render deployment"
+git push
+```
+
+3. In Render, create a new **Blueprint** from your GitHub repo (uses `render.yaml`).
+
+4. If service names differ, adjust in `render.yaml`:
+- `VITE_API_BASE`
+- `VITE_TILESERVER_BASE`
+
+to your actual Render service URLs if names differ.
+
+Notes:
+- Render builds Docker images from your repo contents and Dockerfiles during deploy.
+- Images are not stored in GitHub; only source files and Dockerfiles are in GitHub.

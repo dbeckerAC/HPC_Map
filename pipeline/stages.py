@@ -423,6 +423,7 @@ def stage_normalize_chargers(cfg: AppConfig, root: Path) -> tuple[Path, Path]:
                 "lat": lat,
                 "lon": lon,
                 "power_kw": power,
+                "operator": (row.get("Betreiber") or "").strip(),
                 "status": (row.get("Status") or "").strip(),
             }
     if not dedup:
@@ -908,6 +909,7 @@ def stage_build_hpc_points_layer(cfg: AppConfig, root: Path, chargers_path: Path
             "properties": {
                 "charger_id": c["charger_id"],
                 "power_kw": c["power_kw"],
+                "operator": c.get("operator", ""),
                 "status": c.get("status", ""),
                 "min_power_kw": cfg.min_power_kw,
             },
@@ -930,7 +932,9 @@ def stage_generate_mbtiles(cfg: AppConfig, root: Path, segments_path: Path) -> P
         str(mbtiles),
         "-l",
         cfg.tiles.distance_layer_name,
-        "-zg",
+        "-Z4",
+        "-z14",
+        "--extend-zooms-if-still-dropping",
         "--drop-densest-as-needed",
         str(segments_path),
     ]
@@ -959,7 +963,9 @@ def stage_generate_hpc_sites_mbtiles(cfg: AppConfig, root: Path, hpc_points_path
         str(mbtiles),
         "-l",
         cfg.tiles.hpc_layer_name,
-        "-zg",
+        "-Z4",
+        "-z14",
+        "--extend-zooms-if-still-dropping",
         "--drop-densest-as-needed",
         str(hpc_points_path),
     ]

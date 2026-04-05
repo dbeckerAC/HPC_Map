@@ -13,3 +13,5 @@ tools/graphhopper/
 data/raw/osm/
 .venv/
 hpc_map.egg-info/
+data/raw/bnetza/*.xlsx
+data/raw/bnetza/~$*.xlsx

@@ -1,8 +1,8 @@
 import maplibregl from "maplibre-gl";
 import "./styles.css";
 
-const API_BASE = "http://localhost:8000";
-const TILESERVER_BASE = "http://localhost:8080";
+const API_BASE = (import.meta.env.VITE_API_BASE || "http://localhost:8000").replace(/\/$/, "");
+const TILESERVER_BASE = (import.meta.env.VITE_TILESERVER_BASE || "http://localhost:8080").replace(/\/$/, "");
 const DISTANCE_TILES = `${TILESERVER_BASE}/data/hpc_distance/{z}/{x}/{y}.pbf`;
 const HPC_TILES = `${TILESERVER_BASE}/data/hpc_sites/{z}/{x}/{y}.pbf`;
 const hoverEl = document.getElementById("hover");
@@ -175,7 +175,7 @@ function addHpcLayer(source, sourceLayer = null) {
 map.on("load", async () => {
   const mode = await getLayerMode();
   if (mode === "vector") {
-    map.addSource("distance", { type: "vector", tiles: [DISTANCE_TILES], minzoom: 4, maxzoom: 14 });
+    map.addSource("distance", { type: "vector", tiles: [DISTANCE_TILES], minzoom: 4, maxzoom: 22 });
     map.addSource("hpc", {
       type: "geojson",
       data: `${API_BASE}/layers/hpc-sites.geojson`,
@@ -231,8 +231,9 @@ function bindHoverEvents() {
     if (!feature) return;
     const chargerId = feature.properties?.charger_id ?? "n/a";
     const power = feature.properties?.power_kw ?? "n/a";
+    const operator = feature.properties?.operator || "n/a";
     const status = feature.properties?.status || "n/a";
-    hoverEl.textContent = `HPC ${chargerId} | ${power} kW | ${status}`;
+    hoverEl.textContent = `HPC ${chargerId} | ${power} kW | ${operator} | ${status}`;
   });
 
   map.on("mouseleave", "hpc-sites", () => {
