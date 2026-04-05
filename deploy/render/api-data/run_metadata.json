@@ -1,0 +1,24 @@
+{
+  "completed_at": "2026-04-05T23:36:04.671726+00:00",
+  "subset_bbox": {
+    "min_lat": 47.2,
+    "min_lon": 5.8,
+    "max_lat": 55.1,
+    "max_lon": 15.1
+  },
+  "min_power_kw": 150.0,
+  "sampling_interval_m": 2000.0,
+  "directional_offset_m": 10.0,
+  "preselection": {
+    "count": 8,
+    "max_air_km": 75.0,
+    "grid_cell_km": 25.0
+  },
+  "color": {
+    "min_km": 0.0,
+    "max_km": 20.0,
+    "clamp_above_max": true
+  },
+  "routing_distance_mode": "exit_based",
+  "routing_provider": "graphhopper"
+}
