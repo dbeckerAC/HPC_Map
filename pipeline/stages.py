@@ -40,6 +40,9 @@ class StageError(RuntimeError):
     pass
 
 
+NORMALIZE_STAGE_VERSION = 2
+
+
 def _within_bbox(lon: float, lat: float, cfg: AppConfig) -> bool:
     b = cfg.subset_bbox
     return b.min_lon <= lon <= b.max_lon and b.min_lat <= lat <= b.max_lat
@@ -385,7 +388,7 @@ def stage_normalize_chargers(cfg: AppConfig, root: Path) -> tuple[Path, Path]:
     checksum = checksum_file(raw_csv)
     if checksum_path.exists() and out_path.exists():
         old = read_json(checksum_path)
-        if old.get("sha256") == checksum:
+        if old.get("sha256") == checksum and int(old.get("normalize_stage_version", 0)) == NORMALIZE_STAGE_VERSION:
             existing = read_json(out_path).get("chargers", [])
             if existing:
                 return out_path, checksum_path
@@ -430,7 +433,14 @@ def stage_normalize_chargers(cfg: AppConfig, root: Path) -> tuple[Path, Path]:
         raise StageError("No eligible chargers after filtering.")
     ensure_dir(out_path.parent)
     write_json(out_path, {"chargers": list(dedup.values())})
-    write_json(checksum_path, {"sha256": checksum, "updated_at": datetime.now(timezone.utc).isoformat()})
+    write_json(
+        checksum_path,
+        {
+            "sha256": checksum,
+            "normalize_stage_version": NORMALIZE_STAGE_VERSION,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
     return out_path, checksum_path
 
 

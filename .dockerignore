@@ -7,9 +7,10 @@ tools/graphhopper
 data/raw
 data/cache
 data/intermediate
-data/processed
+data/processed/*
+!data/processed/hpc_sites.geojson
+!data/processed/run_metadata.json
 __pycache__
 *.mbtiles
 *.log
 .DS_Store
-

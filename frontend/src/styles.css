@@ -41,6 +41,24 @@ body,
   color: var(--muted);
 }
 
+#intro {
+  margin: 0 0 12px;
+  padding: 10px;
+  border: 1px solid #d2dae3;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.intro-line {
+  font-size: 0.82rem;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.intro-line + .intro-line {
+  margin-top: 6px;
+}
+
 #legend {
   margin: 0 0 12px;
   padding: 10px;
@@ -106,6 +124,11 @@ body,
 @media (max-width: 900px) {
   #app {
     grid-template-columns: 1fr;
-    grid-template-rows: 220px 1fr;
+    grid-template-rows: 300px 1fr;
+  }
+
+  #panel {
+    overflow: auto;
+    -webkit-overflow-scrolling: touch;
   }
 }
