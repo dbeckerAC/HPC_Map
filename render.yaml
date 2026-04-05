@@ -26,3 +26,5 @@ services:
         value: https://hpc-map-api.onrender.com
       - key: VITE_TILESERVER_BASE
         value: https://hpc-map-tileserver.onrender.com
+      - key: VITE_FORCE_VECTOR
+        value: "true"

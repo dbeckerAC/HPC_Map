@@ -3,6 +3,7 @@ import "./styles.css";
 
 const API_BASE = (import.meta.env.VITE_API_BASE || "http://localhost:8000").replace(/\/$/, "");
 const TILESERVER_BASE = (import.meta.env.VITE_TILESERVER_BASE || "http://localhost:8080").replace(/\/$/, "");
+const FORCE_VECTOR = String(import.meta.env.VITE_FORCE_VECTOR || "").toLowerCase() === "true";
 const DISTANCE_TILES = `${TILESERVER_BASE}/data/hpc_distance/{z}/{x}/{y}.pbf`;
 const HPC_TILES = `${TILESERVER_BASE}/data/hpc_sites/{z}/{x}/{y}.pbf`;
 const hoverEl = document.getElementById("hover");
@@ -39,6 +40,9 @@ const map = new maplibregl.Map({
 });
 
 async function getLayerMode() {
+  if (FORCE_VECTOR) {
+    return "vector";
+  }
   try {
     const response = await fetch(`${API_BASE}/layers/status`);
     if (!response.ok) {
@@ -176,15 +180,9 @@ map.on("load", async () => {
   const mode = await getLayerMode();
   if (mode === "vector") {
     map.addSource("distance", { type: "vector", tiles: [DISTANCE_TILES], minzoom: 4, maxzoom: 22 });
-    map.addSource("hpc", {
-      type: "geojson",
-      data: `${API_BASE}/layers/hpc-sites.geojson`,
-      cluster: true,
-      clusterRadius: 42,
-      clusterMaxZoom: 8
-    });
+    map.addSource("hpc", { type: "vector", tiles: [HPC_TILES], minzoom: 4, maxzoom: 22 });
     addDistanceLayer("distance", "hpc_distance");
-    addHpcLayer("hpc");
+    addHpcLayer("hpc", "hpc_sites");
     hoverEl.textContent = "Hover a motorway segment";
     bindHoverEvents();
     return;
