@@ -43,6 +43,18 @@ class RoutingConfig(BaseModel):
     route_timeout_seconds: int = 8
     max_workers: int = 12
     progress_every_points: int = 250
+    graphhopper_exact: "GraphHopperExactConfig" = Field(default_factory=lambda: GraphHopperExactConfig())
+
+
+class GraphHopperExactConfig(BaseModel):
+    enabled: bool = True
+    request_retries: int = Field(default=2, ge=0)
+    request_backoff_seconds: float = Field(default=0.4, ge=0)
+    max_candidates_per_point: int = Field(default=5000, ge=1)
+    initial_candidate_batch: int = Field(default=16, ge=1)
+    max_heading_deviation_deg: float = Field(default=95.0, gt=0, le=180)
+    heading_penalty_relaxed: int = Field(default=60, ge=0)
+    heading_penalty_strict: int = Field(default=300, ge=0)
 
 
 class PathsConfig(BaseModel):

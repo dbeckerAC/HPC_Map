@@ -30,12 +30,21 @@ overpass:
   refresh_confirmed: false
 
 routing:
-  distance_mode: "exit_based"
+  distance_mode: "graphhopper"
   provider: "graphhopper"
-  graphhopper_base_url: "http://localhost:8989"
+  graphhopper_base_url: "http://graphhopper:8989"
   route_timeout_seconds: 8
   max_workers: 12
   progress_every_points: 250
+  graphhopper_exact:
+    enabled: true
+    request_retries: 2
+    request_backoff_seconds: 0.4
+    max_candidates_per_point: 5000
+    initial_candidate_batch: 16
+    max_heading_deviation_deg: 95
+    heading_penalty_relaxed: 60
+    heading_penalty_strict: 300
 
 paths:
   motorway_cache_geojson: "data/raw/osm/motorways.geojson"

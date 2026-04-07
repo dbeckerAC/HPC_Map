@@ -5,7 +5,7 @@ GraphHopper-based prototype for visualizing motorway distance to eligible HPC ch
 ## Locked Architecture
 
 - Motorways: Overpass API (cached locally)
-- Distance computation: configurable (`exit_based` default, `graphhopper` optional)
+- Distance computation: configurable (`graphhopper` exact default, `exit_based` optional)
 - Preprocessing: Python pipeline with restartable artifacts
 - Map delivery: MBTiles + tile server + MapLibre GL JS
 
@@ -78,6 +78,10 @@ rm -rf tools/graphhopper/graph-cache
 docker compose up graphhopper --remove-orphans
 ```
 
+Windows note:
+- This setup also works on Windows with Docker Desktop + Compose.
+- For full Germany import, use a machine with at least 16 GB RAM (32 GB preferred).
+
 ## Run Pipeline
 
 ```bash
@@ -85,8 +89,9 @@ docker compose run --rm pipeline
 ```
 
 Current default in `config/default.yaml`:
-- `routing.distance_mode: exit_based` (no routing engine required; direction-aware motorway exit approximation)
-- switch to `routing.distance_mode: graphhopper` when you want real route distances
+- `routing.distance_mode: graphhopper`
+- `routing.graphhopper_base_url: http://graphhopper:8989` (inside compose network)
+- exact adaptive search enabled via `routing.graphhopper_exact.*` (provably best route distance with heading-constrained start)
 
 Outputs:
 
@@ -126,7 +131,7 @@ Open `http://localhost:5173`.
 ## Notes
 
 - Route stage is parallelized and logs progress.
-- Preselection uses BallTree nearest-neighbor search for Euclidean/haversine mode performance.
+- GraphHopper exact mode uses BallTree + adaptive lower-bound pruning (no fixed top-K approximation).
 - Motorway extraction uses Overpass bbox queries (internally tiled for reliability), then geometries are clipped to Germany polygon before sampling.
 - Overpass cache refresh requires confirmation when older than 90 days (config-driven).
 - An HPC stations layer (`hpc_sites`) is generated from CSV-filtered chargers.

@@ -6,6 +6,9 @@ const TILESERVER_BASE = (import.meta.env.VITE_TILESERVER_BASE || "http://localho
 const DISTANCE_TILES = `${TILESERVER_BASE}/data/hpc_distance/{z}/{x}/{y}.pbf`;
 const hoverEl = document.getElementById("hover");
 const hpcToggle = document.getElementById("hpc-toggle");
+const appEl = document.getElementById("app");
+const panelToggle = document.getElementById("panel-toggle");
+const PANEL_STATE_KEY = "hpc_panel_collapsed";
 
 const map = new maplibregl.Map({
   container: "map",
@@ -36,6 +39,23 @@ const map = new maplibregl.Map({
     ]
   }
 });
+
+function setPanelCollapsed(collapsed) {
+  if (!appEl || !panelToggle) return;
+  appEl.classList.toggle("panel-collapsed", collapsed);
+  panelToggle.textContent = collapsed ? "Show info" : "Hide info";
+  panelToggle.setAttribute("aria-expanded", String(!collapsed));
+  window.localStorage.setItem(PANEL_STATE_KEY, collapsed ? "1" : "0");
+  setTimeout(() => map.resize(), 120);
+}
+
+if (panelToggle) {
+  const persisted = window.localStorage.getItem(PANEL_STATE_KEY) === "1";
+  setPanelCollapsed(persisted);
+  panelToggle.addEventListener("click", () => {
+    setPanelCollapsed(!appEl?.classList.contains("panel-collapsed"));
+  });
+}
 
 function addDistanceLayer(source, sourceLayer = null) {
   const casing = {

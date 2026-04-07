@@ -6,7 +6,7 @@ HPC Routing Distance Map Germany
 
 ## Status
 
-Draft v2.2 (Exit-based active, routing-ready)
+Draft v2.3 (GraphHopper exact active)
 
 ## Goal
 
@@ -18,8 +18,8 @@ The app must avoid loading large raw point datasets in the browser and must use 
 
 - Motorway extraction: Overpass API (cached locally as GeoJSON)
 - Directional sampling: points every configurable interval, offset by configurable lateral distance from centerline using heading-derived normal vectors
-- Distance mode default: exit-based approximation without routing engine
-- Optional routing engine: local GraphHopper Java server
+- Distance mode default: GraphHopper exact routing
+- Fallback mode: exit-based approximation without routing engine
 - Charger source: Bundesnetzagentur CSV
 - Layer output: precomputed line segments and HPC points; tiled delivery via MBTiles
 - Frontend rendering: MapLibre GL JS
@@ -51,13 +51,13 @@ The app must avoid loading large raw point datasets in the browser and must use 
 4. Create two directional point sets using lateral offset (`directional_offset_m`) from centerline.
    - Exception: for one-way motorway carriageways, use a single directional geometry to avoid duplicate visual lanes.
 5. Normalize and filter eligible chargers from CSV.
-6. Preselect nearby charger candidates per sampled point (air-distance filter).
-   - Implementation uses BallTree nearest-neighbor search (haversine metric) for fast candidate lookup.
-   - Grid-based lookup remains as fallback when BallTree runtime is unavailable.
+6. Build BallTree over all eligible chargers.
 7. Compute sampled-point to charger distance using configured mode:
-   - `exit_based` (active default): distance to next motorway exit in driving direction + Euclidean exit-to-nearest-HPC
-   - `euclidean`: direct air-distance fallback
-   - `graphhopper`: full routing mode
+   - `graphhopper` (active default): direction-constrained GraphHopper routing with exact adaptive candidate search.
+     - Candidates are tested in ascending air distance.
+     - Stopping rule: stop when next unseen candidate air distance is greater than or equal to current best route distance.
+   - `exit_based`: distance to next motorway exit in driving direction + Euclidean exit-to-nearest-HPC
+   - `euclidean`: direct air-distance mode
 8. Keep nearest candidate by computed distance.
 9. Build motorway line segments between consecutive sampled points and attach endpoint route distances.
 10. Build HPC points layer from filtered chargers.
@@ -72,12 +72,11 @@ The app must avoid loading large raw point datasets in the browser and must use 
   - `max_lon=15.1`
 - Sampling interval: `2000 m`
 - Directional offset: `10 m`
-- Candidate count: `8`
-- Candidate radius: `75 km` (air distance)
+- GraphHopper exact max candidates per point: `5000` (safety guard)
 - Distance color range: `0..20 km`, green to red, clamp above max
-- Distance mode default: `exit_based`
+- Distance mode default: `graphhopper`
 - Routing provider (when enabled): `graphhopper`
-- GraphHopper endpoint default: `http://localhost:8989`
+- GraphHopper endpoint default (compose): `http://graphhopper:8989`
 
 ## Output Layers
 
@@ -102,9 +101,10 @@ The app must avoid loading large raw point datasets in the browser and must use 
 - Render base map and precomputed distance layer.
 - Do not render raw sampled point set.
 - Hover on distance segments displays value in km and active minimum power threshold.
-- Show HPC sites as point layer by default with a checkbox to hide/show stations.
+- Show HPC sites layer hidden by default with a checkbox to show/hide stations.
 - Layer loading mode:
-  - vector tiles from MBTiles only
+  - distance via MBTiles vector layer
+  - HPC stations via clustered API GeoJSON
 
 ## Performance Rules
 

@@ -77,8 +77,14 @@ def run(config_path: Path, fresh: bool = False) -> None:
     _log(f"artifact {points}")
     chargers, _ = _run_stage("normalize_chargers", lambda: stage_normalize_chargers(cfg, root))
     _log(f"artifact {chargers}")
-    preselected = _run_stage("preselect_candidates", lambda: stage_preselect_candidates(cfg, root, points, chargers))
-    _log(f"artifact {preselected}")
+    preselected = None
+    mode = (cfg.routing.distance_mode or "euclidean").lower().strip()
+    exact_graphhopper = mode == "graphhopper" and cfg.routing.graphhopper_exact.enabled
+    if mode not in {"exit_based"} and not exact_graphhopper:
+        preselected = _run_stage("preselect_candidates", lambda: stage_preselect_candidates(cfg, root, points, chargers))
+        _log(f"artifact {preselected}")
+    else:
+        _log("skip preselect_candidates (not needed for selected routing mode)")
     routes = _run_stage("route_distances", lambda: stage_route_distances(cfg, root, points, preselected))
     _log(f"artifact {routes}")
     segments = _run_stage("build_segments", lambda: stage_build_segments(cfg, root, points, routes))

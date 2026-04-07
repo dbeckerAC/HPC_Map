@@ -535,7 +535,112 @@ def _preselect_candidates_grid(cfg: AppConfig, points: list[dict[str, Any]], cha
     return rows
 
 
-def stage_route_distances(cfg: AppConfig, root: Path, points_path: Path, preselected_path: Path) -> Path:
+def _normalize_bearing_deg(deg: float) -> float:
+    return (deg + 360.0) % 360.0
+
+
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dlambda = math.radians(lon2 - lon1)
+    y = math.sin(dlambda) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlambda)
+    return _normalize_bearing_deg(math.degrees(math.atan2(y, x)))
+
+
+def _heading_diff_deg(a: float, b: float) -> float:
+    d = abs(_normalize_bearing_deg(a) - _normalize_bearing_deg(b))
+    return min(d, 360.0 - d)
+
+
+def _build_point_heading_index(points: list[dict[str, Any]]) -> dict[str, float]:
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for p in points:
+        grouped[(str(p["way_id"]), int(p.get("side", 0)))].append(p)
+
+    headings: dict[str, float] = {}
+    for (_, side), arr in grouped.items():
+        arr.sort(key=lambda x: int(x.get("seq", 0)))
+        n = len(arr)
+        if n < 2:
+            continue
+        for i, p in enumerate(arr):
+            if i < n - 1:
+                p2 = arr[i + 1]
+                base_heading = _bearing_deg(float(p["lat"]), float(p["lon"]), float(p2["lat"]), float(p2["lon"]))
+            else:
+                p1 = arr[i - 1]
+                base_heading = _bearing_deg(float(p1["lat"]), float(p1["lon"]), float(p["lat"]), float(p["lon"]))
+
+            oneway = str(p.get("oneway", "")).strip().lower()
+            if side == -1 or (side == 0 and oneway == "-1"):
+                travel_heading = _normalize_bearing_deg(base_heading + 180.0)
+            else:
+                travel_heading = base_heading
+            headings[str(p["id"])] = travel_heading
+    return headings
+
+
+def _extract_route_km_with_heading_validation(body: dict[str, Any], expected_heading_deg: float, max_diff_deg: float) -> float | None:
+    paths = body.get("paths") or []
+    if not paths:
+        return None
+    first = paths[0]
+    meters = first.get("distance")
+    if meters is None:
+        return None
+
+    points_obj = first.get("points") or {}
+    coords = points_obj.get("coordinates") or []
+    if len(coords) >= 2:
+        # GeoJSON coordinates are [lon, lat].
+        obs_heading = _bearing_deg(float(coords[0][1]), float(coords[0][0]), float(coords[1][1]), float(coords[1][0]))
+        if _heading_diff_deg(obs_heading, expected_heading_deg) > max_diff_deg:
+            return None
+
+    return float(meters) / 1000.0
+
+
+def _graphhopper_route_km_heading(cfg: AppConfig, lat1: float, lon1: float, lat2: float, lon2: float, heading_deg: float) -> float | None:
+    penalties = [
+        int(cfg.routing.graphhopper_exact.heading_penalty_relaxed),
+        int(cfg.routing.graphhopper_exact.heading_penalty_strict),
+    ]
+    retries = int(cfg.routing.graphhopper_exact.request_retries)
+    backoff = float(cfg.routing.graphhopper_exact.request_backoff_seconds)
+    max_heading_dev = float(cfg.routing.graphhopper_exact.max_heading_deviation_deg)
+
+    for penalty in penalties:
+        for attempt in range(retries + 1):
+            try:
+                params: list[tuple[str, str]] = [
+                    ("profile", "car"),
+                    ("point", f"{lat1},{lon1}"),
+                    ("point", f"{lat2},{lon2}"),
+                    ("heading", f"{heading_deg:.2f}"),
+                    ("heading_penalty", str(penalty)),
+                    ("instructions", "false"),
+                    ("calc_points", "true"),
+                    ("points_encoded", "false"),
+                    ("ch.disable", "true"),
+                ]
+                resp = requests.get(
+                    f"{cfg.routing.graphhopper_base_url}/route",
+                    params=params,
+                    timeout=cfg.routing.route_timeout_seconds,
+                )
+                resp.raise_for_status()
+                parsed = _extract_route_km_with_heading_validation(resp.json(), heading_deg, max_heading_dev)
+                if parsed is not None:
+                    return parsed
+            except Exception:
+                pass
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+    return None
+
+
+def stage_route_distances(cfg: AppConfig, root: Path, points_path: Path, preselected_path: Path | None) -> Path:
     target = root / cfg.paths.intermediate_dir / "05_route_distances.json"
     if target.exists():
         existing = read_json(target).get("routes", [])
@@ -552,6 +657,10 @@ def stage_route_distances(cfg: AppConfig, root: Path, points_path: Path, presele
         return _stage_route_distances_exit_based(cfg, root, points_path)
 
     points = {p["id"]: p for p in read_json(points_path).get("points", [])}
+    if mode == "graphhopper" and cfg.routing.graphhopper_exact.enabled:
+        return _stage_route_distances_graphhopper_exact(cfg, root, points_path)
+    if preselected_path is None:
+        raise StageError("preselect_candidates output is required for euclidean/legacy graphhopper mode")
     preselected = read_json(preselected_path).get("preselected", [])
     out = []
     total = len(preselected)
@@ -604,6 +713,114 @@ def stage_route_distances(cfg: AppConfig, root: Path, points_path: Path, presele
         raise StageError("No routes computed from GraphHopper.")
     ensure_dir(target.parent)
     write_json(target, {"routes": out})
+    return target
+
+
+def _stage_route_distances_graphhopper_exact(cfg: AppConfig, root: Path, points_path: Path) -> Path:
+    if BallTree is None:
+        raise StageError("routing.distance_mode=graphhopper exact mode requires scikit-learn BallTree.")
+
+    target = root / cfg.paths.intermediate_dir / "05_route_distances.json"
+    points = read_json(points_path).get("points", [])
+    if not points:
+        raise StageError("No sampled points available.")
+    chargers = read_json(root / cfg.paths.intermediate_dir / "03_eligible_chargers.json").get("chargers", [])
+    if not chargers:
+        raise StageError("No eligible chargers available.")
+
+    headings = _build_point_heading_index(points)
+    charger_rad = [[math.radians(c["lat"]), math.radians(c["lon"])] for c in chargers]
+    tree = BallTree(charger_rad, metric="haversine")
+    earth_radius_km = 6371.0088
+    max_candidates = min(int(cfg.routing.graphhopper_exact.max_candidates_per_point), len(chargers))
+    if max_candidates < 1:
+        raise StageError("routing.graphhopper_exact.max_candidates_per_point must be >= 1")
+    initial_batch = min(max(1, int(cfg.routing.graphhopper_exact.initial_candidate_batch)), max_candidates)
+
+    routes: list[dict[str, Any]] = []
+    failures = 0
+    capped = 0
+    total = len(points)
+
+    def process_point(point: dict[str, Any]) -> dict[str, Any] | None:
+        heading = headings.get(str(point["id"]))
+        if heading is None:
+            return None
+        point_rad = [[math.radians(point["lat"]), math.radians(point["lon"])]]
+        tested: set[int] = set()
+        best_route_km: float | None = None
+        best_charger: dict[str, Any] | None = None
+        k = initial_batch
+        reached_cap_without_proof = False
+
+        while True:
+            dist_rad, idx_arr = tree.query(point_rad, k=k)
+            distances = dist_rad[0]
+            indices = idx_arr[0]
+            for dr, idx in zip(distances, indices):
+                i = int(idx)
+                if i in tested:
+                    continue
+                tested.add(i)
+                candidate = chargers[i]
+                routed_km = _graphhopper_route_km_heading(
+                    cfg,
+                    float(point["lat"]),
+                    float(point["lon"]),
+                    float(candidate["lat"]),
+                    float(candidate["lon"]),
+                    heading,
+                )
+                if routed_km is None:
+                    continue
+                if best_route_km is None or routed_km < best_route_km:
+                    best_route_km = routed_km
+                    best_charger = candidate
+
+            kth_air_km = float(distances[-1]) * earth_radius_km
+            if best_route_km is not None and kth_air_km >= best_route_km:
+                break
+            if k >= max_candidates:
+                reached_cap_without_proof = best_route_km is not None and max_candidates < len(chargers)
+                break
+            k = min(k * 2, max_candidates)
+
+        if best_route_km is None or best_charger is None:
+            return None
+        out = {
+            "point_id": point["id"],
+            "distance_km": float(best_route_km),
+            "charger_id": best_charger["charger_id"],
+            "power_kw": best_charger["power_kw"],
+            "_capped": reached_cap_without_proof,
+        }
+        return out
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.routing.max_workers) as pool:
+        futures = [pool.submit(process_point, p) for p in points]
+        for idx, fut in enumerate(concurrent.futures.as_completed(futures), start=1):
+            res = fut.result()
+            if res is None:
+                failures += 1
+            else:
+                if res.pop("_capped", False):
+                    capped += 1
+                routes.append(res)
+            if idx % max(cfg.routing.progress_every_points, 1) == 0:
+                print(
+                    f"[pipeline] route_distances progress {idx}/{total} (ok={len(routes)} fail={failures} capped={capped})",
+                    flush=True,
+                )
+
+    if capped > 0:
+        raise StageError(
+            f"GraphHopper exact mode hit max_candidates_per_point for {capped} points; "
+            "increase routing.graphhopper_exact.max_candidates_per_point for exact guarantees."
+        )
+    if not routes:
+        raise StageError("No routes computed from GraphHopper exact mode.")
+    ensure_dir(target.parent)
+    write_json(target, {"routes": routes})
     return target
 
 
