@@ -1,5 +1,5 @@
 # HPC Map
-* This is a vibe coding app based on a functional specificatio document (FSD).*
+*This is a vibe coding app based on a functional specificatio document (FSD).*
 
 GraphHopper-based prototype for visualizing motorway distance to eligible HPC chargers.
 
