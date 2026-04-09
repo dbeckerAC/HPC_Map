@@ -42,15 +42,16 @@ services:
       - -lc
       - >
         set -eu;
-        GH_JAR="/graphhopper/current.jar";
-        if [ ! -f "$$GH_JAR" ]; then
-          set -- /graphhopper/graphhopper-web-*.jar;
-          if [ "$$1" = "/graphhopper/graphhopper-web-*.jar" ]; then
-            echo "GraphHopper jar not found in ./tools/graphhopper";
-            exit 1;
-          fi;
-          GH_JAR="$$1";
+        set -- /graphhopper/graphhopper-web-*.jar;
+        if [ "$$1" = "/graphhopper/graphhopper-web-*.jar" ]; then
+          echo "GraphHopper jar not found in ./tools/graphhopper";
+          exit 1;
         fi;
+        if [ "$$#" -gt 1 ]; then
+          echo "Multiple GraphHopper jars found in ./tools/graphhopper; keep only one graphhopper-web-*.jar";
+          exit 1;
+        fi;
+        GH_JAR="$$1";
         if [ ! -f /osm/germany-latest.osm.pbf ]; then
           echo "PBF missing: ./data/raw/osm/germany-latest.osm.pbf";
           exit 1;

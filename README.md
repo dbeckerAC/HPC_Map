@@ -26,9 +26,9 @@ GraphHopper-based prototype for visualizing motorway distance to eligible HPC ch
 **Germany OSM PBF** (`data/raw/osm/germany-latest.osm.pbf`) — only needed for GraphHopper import
 - Download from [Geofabrik](https://download.geofabrik.de/europe/germany-latest.osm.pbf) (~4.4 GB)
 
-**GraphHopper JAR** (`tools/graphhopper/current.jar`) — only needed when running GraphHopper natively (without Docker)
+**GraphHopper JAR** (`tools/graphhopper/graphhopper-web-*.jar`) — only needed when running GraphHopper natively (without Docker)
 - Download the latest `graphhopper-web-*.jar` from the [GraphHopper releases page](https://github.com/graphhopper/graphhopper/releases/)
-- Place it at `tools/graphhopper/current.jar`
+- Place it in `tools/graphhopper/` with its original filename
 
 ## Setup
 

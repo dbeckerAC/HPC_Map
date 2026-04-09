@@ -13,16 +13,23 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root       = Split-Path -Parent $PSScriptRoot
-$GhJar      = Join-Path $Root "tools\graphhopper\current.jar"
+$GhJarDir   = Join-Path $Root "tools\graphhopper"
+$GhJars     = @(Get-ChildItem -Path $GhJarDir -Filter "graphhopper-web-*.jar" -File | Sort-Object Name)
 $PbfPath    = Join-Path $Root "data\raw\osm\germany-latest.osm.pbf"
 $ConfigYml  = Join-Path $Root "config\graphhopper.yml"
 $GraphCache = Join-Path $Root "tools\graphhopper\graph-cache"
 $ImportFlag = Join-Path $Root "tools\graphhopper\.import-complete"
 
-if (-not (Test-Path $GhJar)) {
-    Write-Error "GraphHopper JAR not found at $GhJar. Run .\scripts\fetch_assets.ps1 first."
+if ($GhJars.Count -eq 0) {
+    Write-Error "No GraphHopper JAR found in $GhJarDir. Download graphhopper-web-*.jar and place it there."
     exit 1
 }
+if ($GhJars.Count -gt 1) {
+    $JarList = ($GhJars | ForEach-Object { $_.Name }) -join ", "
+    Write-Error "Multiple GraphHopper JARs found in $GhJarDir: $JarList. Keep only one graphhopper-web-*.jar file."
+    exit 1
+}
+$GhJar = $GhJars[0].FullName
 if (-not (Test-Path $PbfPath)) {
     Write-Error "OSM PBF not found at $PbfPath. Run .\scripts\fetch_assets.ps1 first."
     exit 1
