@@ -24,7 +24,7 @@ services:
       - ./data:/app/data
     depends_on:
       - graphhopper
-    command: ["python", "-m", "pipeline.run_pipeline", "--config", "config/default.yaml", "--fresh"]
+    command: ["python", "-m", "pipeline.run_pipeline", "--config", "config/default.yaml"]
 
   graphhopper:
     image: eclipse-temurin:21-jre

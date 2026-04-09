@@ -1,4 +1,4 @@
-subset_bbox:
+﻿subset_bbox:
   min_lat: 47.2
   min_lon: 5.8
   max_lat: 55.1
@@ -31,9 +31,9 @@ overpass:
 routing:
   distance_mode: "graphhopper"
   provider: "graphhopper"
-  graphhopper_base_url: "http://graphhopper:8989"
+  graphhopper_base_url: "http://127.0.0.1:8989"
   route_timeout_seconds: 8
-  max_workers: 12
+  max_workers: 24
   progress_every_points: 250
   graphhopper_exact:
     enabled: true

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import csv
+import threading
 import hashlib
 import io
 import json
@@ -162,90 +163,77 @@ def stage_extract_motorways(cfg: AppConfig, root: Path) -> Path:
 
 
 def _fetch_motorways_geojson_from_overpass(cfg: AppConfig, out_geojson: Path) -> None:
-    b = cfg.subset_bbox
-    tiles = list(
-        _iter_bbox_tiles(
-            b.min_lat,
-            b.min_lon,
-            b.max_lat,
-            b.max_lon,
-            max(cfg.overpass.tile_size_deg, 0.2),
-        )
-    )
-    features_by_way: dict[int, dict[str, Any]] = {}
+    query = _overpass_query(cfg)
     errors: list[str] = []
-    print(f"[pipeline] overpass tiles {len(tiles)} (tile_size_deg={cfg.overpass.tile_size_deg})", flush=True)
-    for idx, tile_bbox in enumerate(tiles, start=1):
-        query = _overpass_query(cfg, tile_bbox)
-        payload = None
-        tile_ok = False
-        for endpoint in cfg.overpass.endpoints:
-            for attempt in range(1, cfg.overpass.retries_per_endpoint + 1):
-                try:
+    payload = None
+    print("[pipeline] overpass fetching motorways (single query)...", flush=True)
+    for endpoint in cfg.overpass.endpoints:
+        for attempt in range(1, cfg.overpass.retries_per_endpoint + 1):
+            try:
+                resp = requests.post(
+                    endpoint,
+                    data=query,
+                    timeout=cfg.overpass.timeout_seconds + 20,
+                    headers={
+                        "User-Agent": "hpc-map/0.1",
+                        "Content-Type": "text/plain; charset=utf-8",
+                    },
+                )
+                if resp.status_code >= 400:
                     resp = requests.post(
                         endpoint,
-                        data=query,
+                        data={"data": query},
                         timeout=cfg.overpass.timeout_seconds + 20,
-                        headers={
-                            "User-Agent": "hpc-map/0.1",
-                            "Content-Type": "text/plain; charset=utf-8",
-                        },
+                        headers={"User-Agent": "hpc-map/0.1"},
                     )
-                    if resp.status_code >= 400:
-                        resp = requests.post(
-                            endpoint,
-                            data={"data": query},
-                            timeout=cfg.overpass.timeout_seconds + 20,
-                            headers={"User-Agent": "hpc-map/0.1"},
-                        )
-                    resp.raise_for_status()
-                    payload = resp.json()
-                    tile_ok = True
-                    break
-                except Exception as exc:
-                    detail = ""
-                    try:
-                        text = (resp.text or "").strip()[:240]  # type: ignore[name-defined]
-                        if text:
-                            detail = f" | body={text}"
-                    except Exception:
-                        detail = ""
-                    errors.append(f"tile {idx}/{len(tiles)} {endpoint} attempt {attempt}: {exc}{detail}")
-                    if attempt < cfg.overpass.retries_per_endpoint:
-                        time.sleep(cfg.overpass.retry_backoff_seconds * attempt)
-            if tile_ok:
+                resp.raise_for_status()
+                payload = resp.json()
+                print(f"[pipeline] overpass fetch succeeded via {endpoint}", flush=True)
                 break
-        if not tile_ok or payload is None:
-            raise StageError(f"Overpass fetch failed: {' | '.join(errors[-8:])}")
+            except Exception as exc:
+                detail = ""
+                try:
+                    text = (resp.text or "").strip()[:240]  # type: ignore[name-defined]
+                    if text:
+                        detail = f" | body={text}"
+                except Exception:
+                    detail = ""
+                errors.append(f"{endpoint} attempt {attempt}: {exc}{detail}")
+                if attempt < cfg.overpass.retries_per_endpoint:
+                    time.sleep(cfg.overpass.retry_backoff_seconds * attempt)
+        if payload is not None:
+            break
+    if payload is None:
+        raise StageError(f"Overpass fetch failed: {' | '.join(errors)}")
 
-        for element in payload.get("elements", []):
-            if element.get("type") != "way":
-                continue
-            way_id = element.get("id")
-            if not way_id:
-                continue
-            geom = element.get("geometry") or []
-            if len(geom) < 2:
-                continue
-            coords = [[p["lon"], p["lat"]] for p in geom if "lon" in p and "lat" in p]
-            if len(coords) < 2:
-                continue
-            feature = {
-                "type": "Feature",
-                "properties": {
-                    "osm_way_id": way_id,
-                    "highway": (element.get("tags") or {}).get("highway", ""),
-                    "oneway": (element.get("tags") or {}).get("oneway", ""),
-                },
-                "geometry": {"type": "LineString", "coordinates": coords},
-            }
-            prev = features_by_way.get(int(way_id))
-            if prev is None or len(coords) > len((prev.get("geometry") or {}).get("coordinates", [])):
-                features_by_way[int(way_id)] = feature
-        if idx % 5 == 0 or idx == len(tiles):
-            print(f"[pipeline] overpass progress {idx}/{len(tiles)}", flush=True)
+    features_by_way: dict[int, dict[str, Any]] = {}
+    for element in payload.get("elements", []):
+        if element.get("type") != "way":
+            continue
+        way_id = element.get("id")
+        if not way_id:
+            continue
+        geom = element.get("geometry") or []
+        if len(geom) < 2:
+            continue
+        coords = [[p["lon"], p["lat"]] for p in geom if "lon" in p and "lat" in p]
+        if len(coords) < 2:
+            continue
+        feature = {
+            "type": "Feature",
+            "properties": {
+                "osm_way_id": way_id,
+                "highway": (element.get("tags") or {}).get("highway", ""),
+                "oneway": (element.get("tags") or {}).get("oneway", ""),
+            },
+            "geometry": {"type": "LineString", "coordinates": coords},
+        }
+        prev = features_by_way.get(int(way_id))
+        if prev is None or len(coords) > len((prev.get("geometry") or {}).get("coordinates", [])):
+            features_by_way[int(way_id)] = feature
 
     features = list(features_by_way.values())
+    print(f"[pipeline] overpass returned {len(features)} motorway ways", flush=True)
     ensure_dir(out_geojson.parent)
     write_json(out_geojson, {"type": "FeatureCollection", "features": features})
 
@@ -602,41 +590,40 @@ def _extract_route_km_with_heading_validation(body: dict[str, Any], expected_hea
 
 
 def _graphhopper_route_km_heading(cfg: AppConfig, lat1: float, lon1: float, lat2: float, lon2: float, heading_deg: float) -> float | None:
-    penalties = [
-        int(cfg.routing.graphhopper_exact.heading_penalty_relaxed),
-        int(cfg.routing.graphhopper_exact.heading_penalty_strict),
-    ]
+    return _graphhopper_route_km_heading_session(cfg, requests, lat1, lon1, lat2, lon2, heading_deg)
+
+
+def _graphhopper_route_km_heading_session(cfg: AppConfig, session: Any, lat1: float, lon1: float, lat2: float, lon2: float, heading_deg: float) -> float | None:
     retries = int(cfg.routing.graphhopper_exact.request_retries)
     backoff = float(cfg.routing.graphhopper_exact.request_backoff_seconds)
-    max_heading_dev = float(cfg.routing.graphhopper_exact.max_heading_deviation_deg)
 
-    for penalty in penalties:
-        for attempt in range(retries + 1):
-            try:
-                params: list[tuple[str, str]] = [
-                    ("profile", "car"),
-                    ("point", f"{lat1},{lon1}"),
-                    ("point", f"{lat2},{lon2}"),
-                    ("heading", f"{heading_deg:.2f}"),
-                    ("heading_penalty", str(penalty)),
-                    ("instructions", "false"),
-                    ("calc_points", "true"),
-                    ("points_encoded", "false"),
-                    ("ch.disable", "true"),
-                ]
-                resp = requests.get(
-                    f"{cfg.routing.graphhopper_base_url}/route",
-                    params=params,
-                    timeout=cfg.routing.route_timeout_seconds,
-                )
-                resp.raise_for_status()
-                parsed = _extract_route_km_with_heading_validation(resp.json(), heading_deg, max_heading_dev)
-                if parsed is not None:
-                    return parsed
-            except Exception:
-                pass
-            if attempt < retries:
-                time.sleep(backoff * (attempt + 1))
+    for attempt in range(retries + 1):
+        try:
+            params: list[tuple[str, str]] = [
+                ("profile", "car"),
+                ("point", f"{lat1},{lon1}"),
+                ("point", f"{lat2},{lon2}"),
+                ("instructions", "false"),
+                ("calc_points", "false"),
+            ]
+            resp = session.get(
+                f"{cfg.routing.graphhopper_base_url}/route",
+                params=params,
+                timeout=cfg.routing.route_timeout_seconds,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            paths = body.get("paths") or []
+            if not paths:
+                return None
+            meters = paths[0].get("distance")
+            if meters is None:
+                return None
+            return float(meters) / 1000.0
+        except Exception:
+            pass
+        if attempt < retries:
+            time.sleep(backoff * (attempt + 1))
     return None
 
 
@@ -737,80 +724,159 @@ def _stage_route_distances_graphhopper_exact(cfg: AppConfig, root: Path, points_
         raise StageError("routing.graphhopper_exact.max_candidates_per_point must be >= 1")
     initial_batch = min(max(1, int(cfg.routing.graphhopper_exact.initial_candidate_batch)), max_candidates)
 
+    # Group points by (way_id, side) and sort each group by seq.
+    # This enables the warm-start optimisation: the previous point's winning
+    # charger is tried first, which often resolves in a single GH call on
+    # long straight motorway segments.
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for p in points:
+        grouped[(str(p["way_id"]), int(p.get("side", 0)))].append(p)
+    for arr in grouped.values():
+        arr.sort(key=lambda x: int(x.get("seq", 0)))
+    way_groups = list(grouped.values())
+    total = len(points)
+
     routes: list[dict[str, Any]] = []
     failures = 0
     capped = 0
-    total = len(points)
+    completed = 0
+    total_gh_calls = 0
+    total_gh_ms = 0.0
+    lock = threading.Lock()
+    t_start = time.perf_counter()
 
-    def process_point(point: dict[str, Any]) -> dict[str, Any] | None:
-        heading = headings.get(str(point["id"]))
-        if heading is None:
-            return None
-        point_rad = [[math.radians(point["lat"]), math.radians(point["lon"])]]
-        tested: set[int] = set()
-        best_route_km: float | None = None
-        best_charger: dict[str, Any] | None = None
-        k = initial_batch
-        reached_cap_without_proof = False
+    def process_way_group(group: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, float]:
+        # Each group runs in its own thread with its own HTTP session.
+        session = requests.Session()
+        group_routes: list[dict[str, Any]] = []
+        prev_winner_idx: int | None = None  # charger index of previous point's winner
+        gh_calls = 0
+        gh_ms = 0.0
 
-        while True:
-            dist_rad, idx_arr = tree.query(point_rad, k=k)
-            distances = dist_rad[0]
-            indices = idx_arr[0]
-            for dr, idx in zip(distances, indices):
-                i = int(idx)
-                if i in tested:
-                    continue
-                tested.add(i)
-                candidate = chargers[i]
-                routed_km = _graphhopper_route_km_heading(
-                    cfg,
-                    float(point["lat"]),
-                    float(point["lon"]),
-                    float(candidate["lat"]),
-                    float(candidate["lon"]),
+        for point in group:
+            heading = headings.get(str(point["id"]))
+            if heading is None:
+                continue
+            point_rad = [[math.radians(point["lat"]), math.radians(point["lon"])]]
+            tested: set[int] = set()
+            best_route_km: float | None = None
+            best_charger: dict[str, Any] | None = None
+            best_charger_idx: int | None = None
+            reached_cap_without_proof = False
+
+            # Warm start: try the previous winner first.
+            if prev_winner_idx is not None:
+                cand = chargers[prev_winner_idx]
+                _t0 = time.perf_counter()
+                routed_km = _graphhopper_route_km_heading_session(
+                    cfg, session,
+                    float(point["lat"]), float(point["lon"]),
+                    float(cand["lat"]), float(cand["lon"]),
                     heading,
                 )
-                if routed_km is None:
-                    continue
-                if best_route_km is None or routed_km < best_route_km:
+                gh_calls += 1
+                gh_ms += (time.perf_counter() - _t0) * 1000
+                tested.add(prev_winner_idx)
+                if routed_km is not None:
                     best_route_km = routed_km
-                    best_charger = candidate
+                    best_charger = cand
+                    best_charger_idx = prev_winner_idx
 
-            kth_air_km = float(distances[-1]) * earth_radius_km
-            if best_route_km is not None and kth_air_km >= best_route_km:
-                break
-            if k >= max_candidates:
-                reached_cap_without_proof = best_route_km is not None and max_candidates < len(chargers)
-                break
-            k = min(k * 2, max_candidates)
+            # BallTree expansion loop (skipped entirely if warm start already proved optimal).
+            k = initial_batch
+            while True:
+                dist_rad, idx_arr = tree.query(point_rad, k=k)
+                distances = dist_rad[0]
+                indices = idx_arr[0]
 
-        if best_route_km is None or best_charger is None:
-            return None
-        out = {
-            "point_id": point["id"],
-            "distance_km": float(best_route_km),
-            "charger_id": best_charger["charger_id"],
-            "power_kw": best_charger["power_kw"],
-            "_capped": reached_cap_without_proof,
-        }
-        return out
+                # Check stopping condition before routing new candidates.
+                kth_air_km = float(distances[-1]) * earth_radius_km
+                if best_route_km is not None and kth_air_km >= best_route_km:
+                    break
 
+                for dr, idx in zip(distances, indices):
+                    # Early exit: air distance already exceeds best road distance found.
+                    if best_route_km is not None and float(dr) * earth_radius_km >= best_route_km:
+                        break
+                    i = int(idx)
+                    if i in tested:
+                        continue
+                    tested.add(i)
+                    candidate = chargers[i]
+                    _t0 = time.perf_counter()
+                    routed_km = _graphhopper_route_km_heading_session(
+                        cfg, session,
+                        float(point["lat"]), float(point["lon"]),
+                        float(candidate["lat"]), float(candidate["lon"]),
+                        heading,
+                    )
+                    gh_calls += 1
+                    gh_ms += (time.perf_counter() - _t0) * 1000
+                    if routed_km is None:
+                        continue
+                    if best_route_km is None or routed_km < best_route_km:
+                        best_route_km = routed_km
+                        best_charger = candidate
+                        best_charger_idx = i
+
+                kth_air_km = float(distances[-1]) * earth_radius_km
+                if best_route_km is not None and kth_air_km >= best_route_km:
+                    break
+                if k >= max_candidates:
+                    reached_cap_without_proof = best_route_km is not None and max_candidates < len(chargers)
+                    break
+                k = min(k * 2, max_candidates)
+
+            if best_route_km is None or best_charger is None:
+                prev_winner_idx = None
+                continue
+
+            prev_winner_idx = best_charger_idx
+            group_routes.append({
+                "point_id": point["id"],
+                "distance_km": float(best_route_km),
+                "charger_id": best_charger["charger_id"],
+                "power_kw": best_charger["power_kw"],
+                "_capped": reached_cap_without_proof,
+            })
+
+        return group_routes, gh_calls, gh_ms
+
+    last_log_time = t_start
     with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.routing.max_workers) as pool:
-        futures = [pool.submit(process_point, p) for p in points]
+        futures = {pool.submit(process_way_group, grp): grp for grp in way_groups}
         for idx, fut in enumerate(concurrent.futures.as_completed(futures), start=1):
-            res = fut.result()
-            if res is None:
-                failures += 1
-            else:
-                if res.pop("_capped", False):
-                    capped += 1
-                routes.append(res)
-            if idx % max(cfg.routing.progress_every_points, 1) == 0:
+            group_result, grp_calls, grp_ms = fut.result()
+            with lock:
+                for res in group_result:
+                    if res.pop("_capped", False):
+                        capped += 1
+                    routes.append(res)
+                completed += len(futures[fut])
+                failures += len(futures[fut]) - len(group_result)
+                total_gh_calls += grp_calls
+                total_gh_ms += grp_ms
+            now_t = time.perf_counter()
+            time_since_log = now_t - last_log_time
+            if idx % max(1, cfg.routing.progress_every_points // 10) == 0 or time_since_log >= 60:
+                with lock:
+                    _ok = len(routes)
+                    _fail = failures
+                    _calls = total_gh_calls
+                    _ms = total_gh_ms
+                elapsed = time.perf_counter() - t_start
+                pts_per_sec = completed / elapsed if elapsed > 0 else 0
+                eta_s = (total - completed) / pts_per_sec if pts_per_sec > 0 else 0
+                avg_ms = (_ms / _calls) if _calls > 0 else 0
+                calls_per_pt = (_calls / _ok) if _ok > 0 else 0
+                now = datetime.now(timezone.utc).strftime("%H:%M:%S")
                 print(
-                    f"[pipeline] route_distances progress {idx}/{total} (ok={len(routes)} fail={failures} capped={capped})",
+                    f"[pipeline] [{now}] route_distances ways={idx}/{len(way_groups)} pts={completed}/{total} "
+                    f"ok={_ok} fail={_fail} | {pts_per_sec:.1f}pt/s ETA={eta_s/60:.0f}min | "
+                    f"GH calls={_calls} avg={avg_ms:.0f}ms/call calls/pt={calls_per_pt:.1f}",
                     flush=True,
                 )
+                last_log_time = now_t
 
     if capped > 0:
         raise StageError(

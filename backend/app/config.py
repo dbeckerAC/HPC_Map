@@ -31,7 +31,6 @@ class OverpassConfig(BaseModel):
     timeout_seconds: int = 240
     retries_per_endpoint: int = 2
     retry_backoff_seconds: int = 3
-    tile_size_deg: float = 1.2
     cache_max_age_days: int = 90
     refresh_confirmed: bool = False
 

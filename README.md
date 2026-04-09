@@ -1,11 +1,11 @@
 # HPC Map
-*This is a vibe coding app based on a functional specificatio document (FSD).*
+*This is a vibe coding app based on a functional specification document (FSD).*
 
 GraphHopper-based prototype for visualizing motorway distance to eligible HPC chargers.
 
 ## Locked Architecture
 
-- Motorways: Overpass API (cached locally)
+- Motorways: Overpass API (single query, cached locally)
 - Distance computation: configurable (`graphhopper` exact default, `exit_based` optional)
 - Preprocessing: Python pipeline with restartable artifacts
 - Map delivery: MBTiles + tile server + MapLibre GL JS
@@ -13,17 +13,28 @@ GraphHopper-based prototype for visualizing motorway distance to eligible HPC ch
 ## Prerequisites
 
 - Python 3.9+
-- Docker Desktop (for tileserver/api containers)
-- internet access for Overpass and initial GraphHopper download
-- HPC CSV at `data/raw/bnetza/Ladesaeulenregister_BNetzA_2026-03-25.csv`
-- OSM PBF at `data/raw/osm/germany-latest.osm.pbf` (for GraphHopper import)
+- Docker Desktop with Compose (Mac/Linux pipeline + local dev)
+- Internet access for Overpass API
+
+### Required data files
+
+**BNetzA charging station register** (`data/raw/bnetza/`)
+- Download the latest CSV from the [Bundesnetzagentur Ladesäulenkarte](https://www.bundesnetzagentur.de/DE/Fachthemen/ElektrizitaetundGas/E-Mobilitaet/Ladesaeulenkarte/start.html)
+- Place in `data/raw/bnetza/`
+- Update the filename in `config/default.yaml` → `paths.charger_csv` if your date differs
+
+**Germany OSM PBF** (`data/raw/osm/germany-latest.osm.pbf`) — only needed for GraphHopper import
+- Download from [Geofabrik](https://download.geofabrik.de/europe/germany-latest.osm.pbf) (~4.4 GB)
+
+**GraphHopper JAR** (`tools/graphhopper/current.jar`) — only needed when running GraphHopper natively (without Docker)
+- Download the latest `graphhopper-web-*.jar` from the [GraphHopper releases page](https://github.com/graphhopper/graphhopper/releases/)
+- Place it at `tools/graphhopper/current.jar`
 
 ## Setup
 
 ```bash
-cd /Users/Daniel/Documents/Skripte/HPC_Map
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 python3 -m pip install --upgrade pip
 python3 -m pip install -e .
 ```
@@ -34,44 +45,19 @@ Only for local frontend (optional):
 cd frontend && npm install && cd ..
 ```
 
-## GraphHopper (one-time install)
+## Run Pipeline (Mac / Linux — recommended)
+
+Requires Docker Desktop. GraphHopper runs inside the compose network.
 
 ```bash
-./scripts/fetch_graphhopper.sh
+docker compose up graphhopper --remove-orphans   # first run imports graph (~10 min), then serves on :8989
+docker compose run --rm pipeline                 # runs all stages; skips already-completed artifacts
 ```
 
-If you specifically want the release JAR instead of ZIP:
+Import completion is persisted at `tools/graphhopper/.import-complete` — restarts do not re-import.
+For Germany import set Docker Desktop memory to at least 10 GB (16 GB recommended).
 
-```bash
-./scripts/fetch_graphhopper.sh 11.0 --artifact jar
-```
-
-## Start GraphHopper
-
-```bash
-./scripts/start_graphhopper.sh
-```
-
-This imports graph data on first run and starts the server on `http://localhost:8989`.
-
-## Start GraphHopper With Docker Compose (recommended)
-
-Prerequisites for this mode:
-
-- run `./scripts/fetch_graphhopper.sh 11.0 --artifact jar` once (provides `tools/graphhopper/current.jar`)
-- place `germany-latest.osm.pbf` in `data/raw/osm/`
-
-Then run:
-
-```bash
-docker compose up graphhopper --remove-orphans
-```
-
-This imports on first run and then serves GraphHopper on `http://localhost:8989`.
-Import completion is persisted at `tools/graphhopper/.import-complete`, so normal container restarts do not trigger a re-import.
-For Germany import, set Docker Desktop memory high enough (recommended at least 10-12 GB; 16 GB is safer).
-
-If import failed earlier (OOM or interrupted), reset and retry:
+Reset and re-import if needed:
 
 ```bash
 rm -f tools/graphhopper/.import-complete
@@ -79,29 +65,42 @@ rm -rf tools/graphhopper/graph-cache
 docker compose up graphhopper --remove-orphans
 ```
 
-Windows note:
-- This setup also works on Windows with Docker Desktop + Compose.
-- For full Germany import, use a machine with at least 16 GB RAM (32 GB preferred).
+Pipeline outputs:
 
-## Run Pipeline
-
-```bash
-docker compose run --rm pipeline
-```
-
-Current default in `config/default.yaml`:
-- `routing.distance_mode: graphhopper`
-- `routing.graphhopper_base_url: http://graphhopper:8989` (inside compose network)
-- exact adaptive search enabled via `routing.graphhopper_exact.*` (provably best route distance with heading-constrained start)
-
-Outputs:
-
-- `data/intermediate/` stage artifacts
+- `data/intermediate/` — stage artifacts (cached between runs)
 - `data/processed/hpc_distance_segments.geojson`
 - `data/processed/hpc_sites.geojson`
-- `data/processed/hpc_distance.mbtiles` (if `tippecanoe` installed)
-- `data/processed/hpc_sites.mbtiles` (if `tippecanoe` installed)
+- `data/processed/hpc_distance.mbtiles`
+- `data/processed/hpc_sites.mbtiles`
 - `data/processed/run_metadata.json`
+
+## Run Pipeline (Windows — native Java, no Docker)
+
+Requires Java 17+ and the GraphHopper JAR + Germany PBF (see Prerequisites above).
+
+**One-time graph import + start server:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start_graphhopper.ps1
+```
+
+First run imports the graph (~10 min for Germany). Subsequent runs start the server immediately.
+Uses `config/graphhopper.yml` and writes graph cache to `tools/graphhopper/graph-cache/`.
+
+**Run the pipeline:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_pipeline.ps1
+```
+
+Uses `config/local.yaml` (points to `http://127.0.0.1:8989`). Tippecanoe is skipped on Windows — copy the GeoJSON outputs to a Mac and run the Mac pipeline step to produce mbtiles.
+
+**Reset graph cache:**
+
+```powershell
+Remove-Item -Recurse -Force tools\graphhopper\graph-cache
+Remove-Item tools\graphhopper\.import-complete
+```
 
 ## Start API + Tile Server
 
@@ -131,42 +130,48 @@ Open `http://localhost:5173`.
 
 ## Notes
 
-- Route stage is parallelized and logs progress.
-- GraphHopper exact mode uses BallTree + adaptive lower-bound pruning (no fixed top-K approximation).
-- Motorway extraction uses Overpass bbox queries (internally tiled for reliability), then geometries are clipped to Germany polygon before sampling.
+- Route stage is parallelized (`routing.max_workers`) and logs progress with ETA every 30 s.
+- GraphHopper exact mode uses BallTree + adaptive lower-bound pruning (provably optimal result, no fixed top-K approximation). Requires Contraction Hierarchies enabled in `config/graphhopper.yml`.
+- Motorways are fetched from Overpass in a single query and clipped to the Germany polygon before sampling.
 - Overpass cache refresh requires confirmation when older than 90 days (config-driven).
-- An HPC stations layer (`hpc_sites`) is generated from CSV-filtered chargers.
+- An HPC stations layer (`hpc_sites`) is generated from the BNetzA CSV.
 - Frontend uses vector tiles for distance lines and clustered GeoJSON for HPC stations.
+
+## Windows → Mac handoff (produce mbtiles)
+
+After the Windows pipeline finishes, copy this one file to the Mac (same path):
+
+```
+data/intermediate/05_route_distances.json
+```
+
+This is the only file needed. The pipeline on Mac will re-run stages 1–3 (~40s) and stages 6–9 to regenerate all GeoJSON and mbtiles outputs. It skips stage 5 (routing) because `05_` is present.
+
+Then on Mac, run tippecanoe only (no GH needed, no PBF needed):
+
+```bash
+docker compose run --rm --no-deps pipeline
+```
+
+`--no-deps` skips starting the graphhopper container. All stages up to routing are already cached — only the mbtiles generation steps run (seconds).
 
 ## Render.com Deployment
 
-Prerequisites:
-- pipeline already finished
-- `data/processed/hpc_distance.mbtiles` and `data/processed/hpc_sites.mbtiles` exist
-
-1. Stage MBTiles for Render tileserver image:
+Run the full pipeline on Mac first (produces mbtiles). Then:
 
 ```bash
 ./deploy/prepare_render_assets.sh
 ```
 
-This also stages `hpc_sites.geojson` for the Render API image at `deploy/render/api-data/`.
+This stages mbtiles into `deploy/render/tileserver/data/` and `hpc_sites.geojson` into `deploy/render/api-data/`.
 
-2. Commit and push to GitHub:
+Commit and push:
 
 ```bash
-git add render.yaml deploy/render deploy/prepare_render_assets.sh frontend/src/main.js README.md
-git commit -m "Prepare Render deployment"
+git add deploy/render
+git commit -m "chore: update pipeline outputs"
 git push
 ```
 
-3. In Render, create a new **Blueprint** from your GitHub repo (uses `render.yaml`).
-
-4. If service names differ, adjust in `render.yaml`:
-- `VITE_TILESERVER_BASE`
-
-to your actual Render service URLs if names differ.
-
-Notes:
-- Render builds Docker images from your repo contents and Dockerfiles during deploy.
-- Images are not stored in GitHub; only source files and Dockerfiles are in GitHub.
+Render builds Docker images from your repo on every push (configured via `render.yaml` Blueprint).
+If service names differ from defaults, adjust `VITE_TILESERVER_BASE` in `render.yaml`.

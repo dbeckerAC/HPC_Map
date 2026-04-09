@@ -4,7 +4,8 @@ graphhopper:
   profiles:
     - name: car
       custom_model_files: [car.json]
-  profiles_ch: []
+  profiles_ch:
+    - profile: car
   profiles_lm: []
   graph.encoded_values: car_access, car_average_speed, road_access
   prepare.min_network_size: 200
