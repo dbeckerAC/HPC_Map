@@ -139,13 +139,21 @@ Open `http://localhost:5173`.
 
 ## Windows → Mac handoff (produce mbtiles)
 
-After the Windows pipeline finishes, copy this one file to the Mac (same path):
+After the Windows pipeline finishes, copy these intermediate artifacts to the Mac
+(same paths under `data/intermediate/`):
 
 ```
+data/intermediate/01_motorways_clipped.geojson
+data/intermediate/02_directional_sample_points.json
+data/intermediate/03_charger_checksum.json
+data/intermediate/03_eligible_chargers.json
 data/intermediate/05_route_distances.json
 ```
 
-This is the only file needed. The pipeline on Mac will re-run stages 1–3 (~40s) and stages 6–9 to regenerate all GeoJSON and mbtiles outputs. It skips stage 5 (routing) because `05_` is present.
+These files form a coupled cache set. Copying only `05_route_distances.json` is not
+safe because stages 2 and 3 must match the point ids and charger set used when routing.
+With the full set present, the pipeline reuses stages 1-5 and regenerates only the
+processed GeoJSON, run metadata, and mbtiles outputs.
 
 Then on Mac, run tippecanoe only (no GH needed, no PBF needed):
 
@@ -153,7 +161,9 @@ Then on Mac, run tippecanoe only (no GH needed, no PBF needed):
 docker compose run --rm --no-deps pipeline
 ```
 
-`--no-deps` skips starting the graphhopper container. All stages up to routing are already cached — only the mbtiles generation steps run (seconds).
+`--no-deps` skips starting the graphhopper container. With the intermediate cache set
+in place, the pipeline reuses stages 1-5 and only rebuilds downstream processed
+outputs and mbtiles.
 
 ## Render.com Deployment
 

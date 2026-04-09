@@ -95,6 +95,10 @@ def stage_extract_motorways(cfg: AppConfig, root: Path) -> Path:
     source = root / cfg.paths.motorway_cache_geojson
     source_meta = source.with_suffix(".meta.json")
     target = root / cfg.paths.intermediate_dir / "01_motorways_clipped.geojson"
+    if target.exists():
+        existing = read_json(target).get("features", [])
+        if existing:
+            return target
     query_signature = hashlib.sha1(_overpass_query(cfg).encode("utf-8")).hexdigest()
 
     stale = False
