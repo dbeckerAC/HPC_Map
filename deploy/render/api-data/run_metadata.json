@@ -1,5 +1,5 @@
 {
-  "completed_at": "2026-04-06T00:06:58.927446+00:00",
+  "completed_at": "2026-04-09T16:03:22.639465+00:00",
   "subset_bbox": {
     "min_lat": 47.2,
     "min_lon": 5.8,
@@ -19,6 +19,6 @@
     "max_km": 20.0,
     "clamp_above_max": true
   },
-  "routing_distance_mode": "exit_based",
+  "routing_distance_mode": "graphhopper",
   "routing_provider": "graphhopper"
 }
