@@ -7,7 +7,7 @@ graphhopper:
   profiles_ch:
     - profile: car
   profiles_lm: []
-  graph.encoded_values: car_access, car_average_speed, road_access
+  graph.encoded_values: car_access, car_average_speed, road_access, road_class
   prepare.min_network_size: 200
   prepare.subnetworks.threads: 1
   routing.non_ch.max_waypoint_distance: 1000000

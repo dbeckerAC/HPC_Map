@@ -3,12 +3,15 @@ import "./styles.css";
 
 const API_BASE = (import.meta.env.VITE_API_BASE || "http://localhost:8000").replace(/\/$/, "");
 const TILESERVER_BASE = (import.meta.env.VITE_TILESERVER_BASE || "http://localhost:8080").replace(/\/$/, "");
-const DISTANCE_TILES = `${TILESERVER_BASE}/data/hpc_distance/{z}/{x}/{y}.pbf`;
 const hoverEl = document.getElementById("hover");
 const hpcToggle = document.getElementById("hpc-toggle");
+const thresholdSelect = document.getElementById("threshold-select");
 const appEl = document.getElementById("app");
 const panelToggle = document.getElementById("panel-toggle");
 const PANEL_STATE_KEY = "hpc_panel_collapsed";
+
+let thresholdVariants = [];
+let activeThreshold = "150";
 
 const map = new maplibregl.Map({
   container: "map",
@@ -40,6 +43,51 @@ const map = new maplibregl.Map({
   }
 });
 
+function thresholdToken(value) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && Number.isInteger(numeric)) {
+    return String(numeric);
+  }
+  return String(value).replace(".", "p");
+}
+
+async function loadConfig() {
+  const response = await fetch(`${API_BASE}/config`);
+  if (!response.ok) {
+    throw new Error(`config request failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+function buildThresholdVariants(config) {
+  const analysis = config.analysis || {};
+  const thresholds = Array.isArray(analysis.power_thresholds_kw) && analysis.power_thresholds_kw.length > 0
+    ? analysis.power_thresholds_kw
+    : [config.min_power_kw ?? 150];
+  const distancePrefix = config.tiles?.distance_layer_prefix || "hpc_distance";
+  const distanceLayer = config.tiles?.distance_layer_name || "hpc_distance";
+  const hpcPrefix = config.tiles?.hpc_layer_prefix || "hpc_sites";
+  const defaultThreshold = thresholdToken(
+    analysis.default_power_threshold_kw ?? config.min_power_kw ?? thresholds[0]
+  );
+  return {
+    defaultThreshold,
+    variants: thresholds.map((value) => {
+      const token = thresholdToken(value);
+      return {
+        id: token,
+        numericValue: Number(value),
+        label: `${value}+ kW`,
+        distanceSource: `distance-${token}`,
+        distanceLayer,
+        hpcSource: `hpc-${token}`,
+        hpcGeojson: `${API_BASE}/layers/${hpcPrefix}_${token}.geojson`,
+        tiles: [`${TILESERVER_BASE}/data/${distancePrefix}_${token}/{z}/{x}/{y}.pbf`]
+      };
+    })
+  };
+}
+
 function setPanelCollapsed(collapsed) {
   if (!appEl || !panelToggle) return;
   appEl.classList.toggle("panel-collapsed", collapsed);
@@ -57,11 +105,19 @@ if (panelToggle) {
   });
 }
 
-function addDistanceLayer(source, sourceLayer = null) {
-  const casing = {
-    id: "hpc-distance-casing",
+function distanceLayerIds(variant) {
+  return [`hpc-distance-casing-${variant.id}`, `hpc-distance-${variant.id}`];
+}
+
+function hpcLayerIds(variant) {
+  return [`hpc-clusters-${variant.id}`, `hpc-cluster-count-${variant.id}`, `hpc-sites-${variant.id}`];
+}
+
+function addDistanceLayer(variant) {
+  map.addLayer({
+    id: `hpc-distance-casing-${variant.id}`,
     type: "line",
-    source,
+    source: variant.distanceSource,
     layout: {
       "line-cap": "round",
       "line-join": "round"
@@ -70,17 +126,14 @@ function addDistanceLayer(source, sourceLayer = null) {
       "line-width": ["interpolate", ["linear"], ["zoom"], 5, 2.6, 12, 6.5],
       "line-color": "#0f141a",
       "line-opacity": 0.55
-    }
-  };
-  if (sourceLayer) {
-    casing["source-layer"] = sourceLayer;
-  }
-  map.addLayer(casing);
+    },
+    "source-layer": variant.distanceLayer
+  });
 
-  const layer = {
-    id: "hpc-distance",
+  map.addLayer({
+    id: `hpc-distance-${variant.id}`,
     type: "line",
-    source,
+    source: variant.distanceSource,
     layout: {
       "line-cap": "round",
       "line-join": "round"
@@ -101,19 +154,16 @@ function addDistanceLayer(source, sourceLayer = null) {
         "#dc2626"
       ],
       "line-opacity": 0.96
-    }
-  };
-  if (sourceLayer) {
-    layer["source-layer"] = sourceLayer;
-  }
-  map.addLayer(layer);
+    },
+    "source-layer": variant.distanceLayer
+  });
 }
 
-function addHpcLayer(source, sourceLayer = null) {
-  const clusters = {
-    id: "hpc-clusters",
+function addHpcLayer(variant) {
+  map.addLayer({
+    id: `hpc-clusters-${variant.id}`,
     type: "circle",
-    source,
+    source: variant.hpcSource,
     filter: ["has", "point_count"],
     paint: {
       "circle-color": "#0b57d0",
@@ -134,11 +184,12 @@ function addHpcLayer(source, sourceLayer = null) {
         28
       ]
     }
-  };
-  const clusterCount = {
-    id: "hpc-cluster-count",
+  });
+
+  map.addLayer({
+    id: `hpc-cluster-count-${variant.id}`,
     type: "symbol",
-    source,
+    source: variant.hpcSource,
     filter: ["has", "point_count"],
     layout: {
       "text-field": ["to-string", ["get", "point_count_abbreviated"]],
@@ -147,11 +198,12 @@ function addHpcLayer(source, sourceLayer = null) {
     paint: {
       "text-color": "#ffffff"
     }
-  };
-  const points = {
-    id: "hpc-sites",
+  });
+
+  map.addLayer({
+    id: `hpc-sites-${variant.id}`,
     type: "circle",
-    source,
+    source: variant.hpcSource,
     filter: ["!", ["has", "point_count"]],
     minzoom: 8.8,
     paint: {
@@ -161,65 +213,52 @@ function addHpcLayer(source, sourceLayer = null) {
       "circle-stroke-color": "#ffffff",
       "circle-stroke-width": 0.9
     }
-  };
-  if (sourceLayer) {
-    clusters["source-layer"] = sourceLayer;
-    clusterCount["source-layer"] = sourceLayer;
-    points["source-layer"] = sourceLayer;
-  }
-  map.addLayer(clusters);
-  map.addLayer(clusterCount);
-  map.addLayer(points);
+  });
 }
 
-map.on("load", () => {
-  if (hpcToggle) {
-    hpcToggle.checked = false;
-  }
-  map.addSource("distance", { type: "vector", tiles: [DISTANCE_TILES], minzoom: 4, maxzoom: 22 });
-  map.addSource("hpc", {
-    type: "geojson",
-    data: `${API_BASE}/layers/hpc-sites.geojson`,
-    cluster: true,
-    clusterRadius: 42,
-    clusterMaxZoom: 8
-  });
-  addDistanceLayer("distance", "hpc_distance");
-  addHpcLayer("hpc");
-  const initialVisibility = hpcToggle?.checked ? "visible" : "none";
-  for (const layerId of ["hpc-clusters", "hpc-cluster-count", "hpc-sites"]) {
+function setLayerVisibility(layerIds, visibility) {
+  for (const layerId of layerIds) {
     if (map.getLayer(layerId)) {
-      map.setLayoutProperty(layerId, "visibility", initialVisibility);
+      map.setLayoutProperty(layerId, "visibility", visibility);
     }
   }
-  hoverEl.textContent = "Hover a motorway segment";
-  bindHoverEvents();
-});
+}
 
-function bindHoverEvents() {
-  map.on("mousemove", "hpc-distance", (event) => {
+function applyActiveThreshold() {
+  const showHpc = !!hpcToggle?.checked;
+  for (const variant of thresholdVariants) {
+    const active = variant.id === activeThreshold;
+    setLayerVisibility(distanceLayerIds(variant), active ? "visible" : "none");
+    setLayerVisibility(hpcLayerIds(variant), active && showHpc ? "visible" : "none");
+  }
+  const label = thresholdVariants.find((variant) => variant.id === activeThreshold)?.label || `${activeThreshold}+ kW`;
+  hoverEl.textContent = `Hover a motorway segment | active threshold: ${label}`;
+}
+
+function bindHoverEventsForVariant(variant) {
+  map.on("mousemove", `hpc-distance-${variant.id}`, (event) => {
     const feature = event.features?.[0];
     if (!feature) return;
     const start = Number(feature.properties?.distance_start_km ?? NaN);
     const end = Number(feature.properties?.distance_end_km ?? NaN);
-    const minPower = feature.properties?.min_power_kw ?? "n/a";
+    const minPower = feature.properties?.min_power_kw ?? `${variant.numericValue}+`;
     const avg = Number.isFinite(start) && Number.isFinite(end) ? ((start + end) / 2).toFixed(2) : "n/a";
     hoverEl.textContent = `Distance: ${avg} km | threshold: ${minPower} kW`;
   });
 
-  map.on("mouseleave", "hpc-distance", () => {
+  map.on("mouseleave", `hpc-distance-${variant.id}`, () => {
     hoverEl.textContent = "Hover a motorway segment";
   });
 
-  map.on("mouseenter", "hpc-sites", () => {
+  map.on("mouseenter", `hpc-sites-${variant.id}`, () => {
     map.getCanvas().style.cursor = "pointer";
   });
 
-  map.on("mouseenter", "hpc-clusters", () => {
+  map.on("mouseenter", `hpc-clusters-${variant.id}`, () => {
     map.getCanvas().style.cursor = "pointer";
   });
 
-  map.on("mousemove", "hpc-sites", (event) => {
+  map.on("mousemove", `hpc-sites-${variant.id}`, (event) => {
     const feature = event.features?.[0];
     if (!feature) return;
     const chargerId = feature.properties?.charger_id ?? "n/a";
@@ -229,31 +268,81 @@ function bindHoverEvents() {
     hoverEl.textContent = `HPC ${chargerId} | ${power} kW | ${operator} | ${status}`;
   });
 
-  map.on("mouseleave", "hpc-sites", () => {
+  map.on("mouseleave", `hpc-sites-${variant.id}`, () => {
     map.getCanvas().style.cursor = "";
     hoverEl.textContent = "Hover a motorway segment";
   });
 
-  map.on("mousemove", "hpc-clusters", (event) => {
+  map.on("mousemove", `hpc-clusters-${variant.id}`, (event) => {
     const feature = event.features?.[0];
     if (!feature) return;
     const count = feature.properties?.point_count_abbreviated ?? feature.properties?.point_count ?? "n/a";
     hoverEl.textContent = `HPC cluster: ${count} stations`;
   });
 
-  map.on("mouseleave", "hpc-clusters", () => {
+  map.on("mouseleave", `hpc-clusters-${variant.id}`, () => {
     map.getCanvas().style.cursor = "";
     hoverEl.textContent = "Hover a motorway segment";
   });
-
-  if (hpcToggle) {
-    hpcToggle.addEventListener("change", () => {
-      const visibility = hpcToggle.checked ? "visible" : "none";
-      for (const layerId of ["hpc-clusters", "hpc-cluster-count", "hpc-sites"]) {
-        if (map.getLayer(layerId)) {
-          map.setLayoutProperty(layerId, "visibility", visibility);
-        }
-      }
-    });
-  }
 }
+
+function populateThresholdSelect(variants) {
+  if (!thresholdSelect) return;
+  thresholdSelect.innerHTML = "";
+  for (const variant of variants) {
+    const option = document.createElement("option");
+    option.value = variant.id;
+    option.textContent = variant.label;
+    thresholdSelect.appendChild(option);
+  }
+  thresholdSelect.value = activeThreshold;
+}
+
+map.on("load", async () => {
+  try {
+    const config = await loadConfig();
+    const thresholdConfig = buildThresholdVariants(config);
+    thresholdVariants = thresholdConfig.variants;
+    activeThreshold = thresholdConfig.defaultThreshold;
+    populateThresholdSelect(thresholdVariants);
+    if (hpcToggle) {
+      hpcToggle.checked = false;
+    }
+
+    for (const variant of thresholdVariants) {
+      map.addSource(variant.distanceSource, {
+        type: "vector",
+        tiles: variant.tiles,
+        minzoom: 4,
+        maxzoom: 22
+      });
+      map.addSource(variant.hpcSource, {
+        type: "geojson",
+        data: variant.hpcGeojson,
+        cluster: true,
+        clusterRadius: 42,
+        clusterMaxZoom: 8
+      });
+      addDistanceLayer(variant);
+      addHpcLayer(variant);
+      bindHoverEventsForVariant(variant);
+    }
+
+    applyActiveThreshold();
+
+    if (hpcToggle) {
+      hpcToggle.addEventListener("change", () => {
+        applyActiveThreshold();
+      });
+    }
+    if (thresholdSelect) {
+      thresholdSelect.addEventListener("change", () => {
+        activeThreshold = thresholdSelect.value;
+        applyActiveThreshold();
+      });
+    }
+  } catch (error) {
+    console.error(error);
+    hoverEl.textContent = "Failed to load threshold configuration";
+  }
+});

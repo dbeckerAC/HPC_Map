@@ -7,16 +7,13 @@ from pathlib import Path
 from backend.app.config import AppConfig
 from pipeline.stages import (
     StageError,
+    publish_default_aliases,
     stage_build_hpc_points_layer,
-    stage_build_segments,
-    stage_extract_motorways,
-    stage_generate_hpc_sites_mbtiles,
     stage_generate_mbtiles,
     stage_normalize_chargers,
-    stage_preselect_candidates,
-    stage_route_distances,
-    stage_sample_points,
+    stage_run_distance_core,
     write_run_metadata,
+    write_tileserver_config,
 )
 
 
@@ -34,27 +31,36 @@ def _run_stage(name: str, fn):
 
 
 def _reset_outputs(cfg: AppConfig, root: Path) -> None:
-    paths = [
-        root / cfg.paths.intermediate_dir / "01_motorways_clipped.geojson",
-        root / cfg.paths.intermediate_dir / "02_directional_sample_points.json",
-        root / cfg.paths.intermediate_dir / "03_charger_checksum.json",
-        root / cfg.paths.intermediate_dir / "03_eligible_chargers.json",
-        root / cfg.paths.intermediate_dir / "03b_motorway_exits.json",
-        root / cfg.paths.intermediate_dir / "04_preselected_candidates.json",
-        root / cfg.paths.intermediate_dir / "05_route_distances.json",
-        root / cfg.paths.processed_dir / "hpc_distance_segments.geojson",
-        root / cfg.paths.processed_dir / "hpc_sites.geojson",
-        root / cfg.tiles.distance_mbtiles_path,
-        root / cfg.tiles.hpc_mbtiles_path,
-        root / cfg.paths.processed_dir / "mbtiles_generation_note.json",
-        root / cfg.paths.processed_dir / "hpc_sites_mbtiles_generation_note.json",
-        root / cfg.paths.processed_dir / "run_metadata.json",
-    ]
     removed = 0
-    for p in paths:
-        if p.exists():
-            p.unlink()
-            removed += 1
+    purge_patterns = [
+        # New artifacts
+        "03_eligible_chargers*.json",
+        "03_charger_checksum.json",
+        "04_distance_core_stats*.json",
+        "hpc_distance_segments*.geojson",
+        "hpc_sites*.geojson",
+        "hpc_distance*.mbtiles",
+        "run_metadata*.json",
+        # Legacy artifacts to purge
+        "01_motorways_clipped.geojson",
+        "02_directional_sample_points.json",
+        "03b_motorway_exits.json",
+        "04_preselected_candidates*.json",
+        "05_route_distances*.json",
+        "hpc_sites*.mbtiles",
+        "mbtiles_generation_note*.json",
+        "hpc_sites_mbtiles_generation_note*.json",
+        "config.json",
+    ]
+    for pattern in purge_patterns:
+        for p in (root / cfg.paths.intermediate_dir).glob(pattern):
+            if p.exists():
+                p.unlink()
+                removed += 1
+        for p in (root / cfg.paths.processed_dir).glob(pattern):
+            if p.exists():
+                p.unlink()
+                removed += 1
     _log(f"fresh mode removed {removed} artifacts")
 
 
@@ -65,37 +71,47 @@ def run(config_path: Path, fresh: bool = False) -> None:
         _reset_outputs(cfg, root)
 
     _log(f"config {config_path}")
-    _log(
-        "bbox "
-        f"{cfg.subset_bbox.min_lat},{cfg.subset_bbox.min_lon} -> "
-        f"{cfg.subset_bbox.max_lat},{cfg.subset_bbox.max_lon}"
-    )
 
-    motorways = _run_stage("extract_motorways", lambda: stage_extract_motorways(cfg, root))
-    _log(f"artifact {motorways}")
-    points = _run_stage("sample_points", lambda: stage_sample_points(cfg, root, motorways))
-    _log(f"artifact {points}")
-    chargers, _ = _run_stage("normalize_chargers", lambda: stage_normalize_chargers(cfg, root))
-    _log(f"artifact {chargers}")
-    preselected = None
-    mode = (cfg.routing.distance_mode or "euclidean").lower().strip()
-    exact_graphhopper = mode == "graphhopper" and cfg.routing.graphhopper_exact.enabled
-    if mode not in {"exit_based"} and not exact_graphhopper:
-        preselected = _run_stage("preselect_candidates", lambda: stage_preselect_candidates(cfg, root, points, chargers))
-        _log(f"artifact {preselected}")
-    else:
-        _log("skip preselect_candidates (not needed for selected routing mode)")
-    routes = _run_stage("route_distances", lambda: stage_route_distances(cfg, root, points, preselected))
-    _log(f"artifact {routes}")
-    segments = _run_stage("build_segments", lambda: stage_build_segments(cfg, root, points, routes))
-    _log(f"artifact {segments}")
-    hpc_sites = _run_stage("build_hpc_sites_layer", lambda: stage_build_hpc_points_layer(cfg, root, chargers))
-    _log(f"artifact {hpc_sites}")
-    dist_mb = _run_stage("generate_distance_mbtiles", lambda: stage_generate_mbtiles(cfg, root, segments))
-    _log(f"artifact {dist_mb}")
-    hpc_mb = _run_stage("generate_hpc_mbtiles", lambda: stage_generate_hpc_sites_mbtiles(cfg, root, hpc_sites))
-    _log(f"artifact {hpc_mb}")
-    write_run_metadata(cfg, root)
+    thresholds = cfg.power_thresholds_kw()
+    default_threshold = cfg.default_power_threshold_kw()
+    default_token = cfg.threshold_token(default_threshold)
+    if default_token not in {cfg.threshold_token(value) for value in thresholds}:
+        raise StageError("analysis.default_power_threshold_kw must be included in analysis.power_thresholds_kw")
+
+    for threshold_kw in thresholds:
+        token = cfg.threshold_token(threshold_kw)
+        _log(f"start threshold {token}+ kW")
+
+        chargers, _ = _run_stage(
+            f"normalize_chargers_{token}",
+            lambda threshold_kw=threshold_kw: stage_normalize_chargers(cfg, root, threshold_kw),
+        )
+        _log(f"artifact {chargers}")
+
+        segments, stats = _run_stage(
+            f"distance_core_{token}",
+            lambda threshold_kw=threshold_kw: stage_run_distance_core(cfg, root, chargers, threshold_kw),
+        )
+        _log(f"artifact {segments}")
+        _log(f"artifact {stats}")
+
+        hpc_sites = _run_stage(
+            f"build_hpc_sites_layer_{token}",
+            lambda threshold_kw=threshold_kw: stage_build_hpc_points_layer(cfg, root, chargers, threshold_kw),
+        )
+        _log(f"artifact {hpc_sites}")
+
+        dist_mb = _run_stage(
+            f"generate_distance_mbtiles_{token}",
+            lambda threshold_kw=threshold_kw: stage_generate_mbtiles(cfg, root, segments, threshold_kw),
+        )
+        _log(f"artifact {dist_mb}")
+
+        write_run_metadata(cfg, root, threshold_kw, stats)
+        _log(f"done  threshold {token}+ kW")
+
+    publish_default_aliases(cfg, root, default_threshold)
+    write_tileserver_config(cfg, root)
     _log("pipeline complete")
 
 

@@ -1,383 +1,151 @@
 from __future__ import annotations
 
-import concurrent.futures
 import csv
-import threading
-import hashlib
 import io
-import json
 import math
+import shutil
 import subprocess
-import time
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import requests
-try:
-    from shapely.geometry import LineString, shape
-except Exception:  # pragma: no cover
-    LineString = None
-    shape = None
-try:
-    from sklearn.neighbors import BallTree
-except Exception:  # pragma: no cover
-    BallTree = None
-
 from backend.app.config import AppConfig
-from pipeline.utils import (
-    checksum_file,
-    ensure_dir,
-    haversine_km,
-    offset_point_from_heading,
-    read_json,
-    sample_polyline,
-    write_json,
-)
+from pipeline.utils import checksum_file, ensure_dir, haversine_km, read_json, write_json
 
 
 class StageError(RuntimeError):
     pass
 
 
-NORMALIZE_STAGE_VERSION = 2
+NORMALIZE_STAGE_VERSION = 4
+CHARGER_CLUSTER_RADIUS_M = 50.0
 
 
-def _within_bbox(lon: float, lat: float, cfg: AppConfig) -> bool:
-    b = cfg.subset_bbox
-    return b.min_lon <= lon <= b.max_lon and b.min_lat <= lat <= b.max_lat
+def _threshold_token(value: float) -> str:
+    return AppConfig.threshold_token(float(value))
 
 
-def _candidate_bbox(cfg: AppConfig) -> tuple[float, float, float, float]:
-    b = cfg.subset_bbox
-    expand_km = cfg.preselection.max_air_km
-    expand_lat_deg = expand_km / 110.574
-    mean_lat = (b.min_lat + b.max_lat) / 2.0
-    cos_lat = max(math.cos(math.radians(mean_lat)), 1e-6)
-    expand_lon_deg = expand_km / (111.320 * cos_lat)
-    return (
-        b.min_lon - expand_lon_deg,
-        b.min_lat - expand_lat_deg,
-        b.max_lon + expand_lon_deg,
-        b.max_lat + expand_lat_deg,
-    )
+def _suffix_for_threshold(value: float) -> str:
+    return f"_{_threshold_token(value)}"
 
 
-def _overpass_query(cfg: AppConfig, bbox: tuple[float, float, float, float] | None = None) -> str:
-    if bbox is None:
-        b = cfg.subset_bbox
-        min_lat, min_lon, max_lat, max_lon = b.min_lat, b.min_lon, b.max_lat, b.max_lon
-    else:
-        min_lat, min_lon, max_lat, max_lon = bbox
-    return f"""
-[out:json][timeout:{cfg.overpass.timeout_seconds}];
-(
-  way["highway"~"motorway|motorway_link"]({min_lat},{min_lon},{max_lat},{max_lon});
-);
-out geom;
-"""
+def _intermediate_path(cfg: AppConfig, root: Path, stem: str, threshold_kw: float | None = None) -> Path:
+    suffix = _suffix_for_threshold(threshold_kw) if threshold_kw is not None else ""
+    return root / cfg.paths.intermediate_dir / f"{stem}{suffix}.json"
 
 
-def _iter_bbox_tiles(min_lat: float, min_lon: float, max_lat: float, max_lon: float, tile_deg: float):
-    lat = min_lat
-    while lat < max_lat:
-        next_lat = min(lat + tile_deg, max_lat)
-        lon = min_lon
-        while lon < max_lon:
-            next_lon = min(lon + tile_deg, max_lon)
-            yield (lat, lon, next_lat, next_lon)
-            lon = next_lon
-        lat = next_lat
+def _processed_geojson_path(cfg: AppConfig, root: Path, stem: str, threshold_kw: float | None = None) -> Path:
+    suffix = _suffix_for_threshold(threshold_kw) if threshold_kw is not None else ""
+    return root / cfg.paths.processed_dir / f"{stem}{suffix}.geojson"
 
 
-def stage_extract_motorways(cfg: AppConfig, root: Path) -> Path:
-    source = root / cfg.paths.motorway_cache_geojson
-    source_meta = source.with_suffix(".meta.json")
-    target = root / cfg.paths.intermediate_dir / "01_motorways_clipped.geojson"
-    if target.exists():
-        existing = read_json(target).get("features", [])
-        if existing:
-            return target
-    query_signature = hashlib.sha1(_overpass_query(cfg).encode("utf-8")).hexdigest()
+def _processed_metadata_path(cfg: AppConfig, root: Path, threshold_kw: float | None = None) -> Path:
+    suffix = _suffix_for_threshold(threshold_kw) if threshold_kw is not None else ""
+    return root / cfg.paths.processed_dir / f"run_metadata{suffix}.json"
 
-    stale = False
-    refresh_reason: str | None = None
-    if source.exists() and source_meta.exists():
-        meta = read_json(source_meta)
-        fetched_at = meta.get("fetched_at")
-        old_sig = str(meta.get("query_signature") or "")
-        if old_sig != query_signature:
-            stale = True
-            refresh_reason = "query_changed"
-        try:
-            fetched = datetime.fromisoformat(fetched_at)
-            if fetched < (datetime.now(timezone.utc) - timedelta(days=cfg.overpass.cache_max_age_days)):
-                stale = True
-                refresh_reason = refresh_reason or "cache_age"
-        except Exception:
-            stale = True
-            refresh_reason = refresh_reason or "invalid_meta"
-    elif source.exists() and not source_meta.exists():
-        # Accept existing cache file as usable; create metadata lazily on next refresh.
-        stale = False
-    elif not source.exists():
-        stale = True
-        refresh_reason = "missing_cache"
-    if (not source.exists()) or stale:
-        # Require explicit confirmation only for age-based refreshes.
-        if source.exists() and stale and refresh_reason == "cache_age" and not cfg.overpass.refresh_confirmed:
-            raise StageError(
-                "Motorway cache older than configured max age. "
-                "Set overpass.refresh_confirmed=true to refresh."
-            )
-        _fetch_motorways_geojson_from_overpass(cfg, source)
-        write_json(
-            source_meta,
-            {
-                "fetched_at": datetime.now(timezone.utc).isoformat(),
-                "cache_max_age_days": cfg.overpass.cache_max_age_days,
-                "bbox": cfg.subset_bbox.model_dump(),
-                "query_signature": query_signature,
-            },
-        )
 
-    germany_polygon = _load_germany_country_polygon(root)
+def _distance_mbtiles_path(cfg: AppConfig, root: Path, threshold_kw: float | None = None) -> Path:
+    if threshold_kw is None:
+        return root / cfg.tiles.distance_mbtiles_path
+    token = _threshold_token(threshold_kw)
+    return root / cfg.paths.processed_dir / f"{cfg.tiles.distance_layer_prefix}_{token}.mbtiles"
 
-    raw = json.loads(source.read_text(encoding="utf-8"))
-    features = []
-    for f in raw.get("features", []):
-        geom = f.get("geometry") or {}
-        if geom.get("type") == "LineString":
-            coords = geom.get("coordinates", [])
-            if any(_within_bbox(c[0], c[1], cfg) for c in coords):
-                for clipped in _clip_linestring_to_germany(coords, germany_polygon):
-                    if len(clipped) < 2:
+
+def _distance_core_stats_path(cfg: AppConfig, root: Path, threshold_kw: float) -> Path:
+    return _intermediate_path(cfg, root, "04_distance_core_stats", threshold_kw)
+
+
+def _cluster_chargers_within_radius(chargers: list[dict[str, Any]], radius_m: float) -> list[dict[str, Any]]:
+    if len(chargers) <= 1:
+        out = []
+        for c in chargers:
+            cp = dict(c)
+            cp["site_size"] = 1
+            out.append(cp)
+        return out
+
+    ordered = sorted(chargers, key=lambda c: str(c["charger_id"]))
+    ref_lat = sum(float(c["lat"]) for c in ordered) / len(ordered)
+    meters_per_deg_lon = 111_320.0 * max(math.cos(math.radians(ref_lat)), 1e-6)
+    meters_per_deg_lat = 110_540.0
+
+    xs: list[float] = []
+    ys: list[float] = []
+    for c in ordered:
+        xs.append(float(c["lon"]) * meters_per_deg_lon)
+        ys.append(float(c["lat"]) * meters_per_deg_lat)
+
+    parent = list(range(len(ordered)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra == rb:
+            return
+        if ra < rb:
+            parent[rb] = ra
+        else:
+            parent[ra] = rb
+
+    cell_size = max(radius_m, 1.0)
+    grid: dict[tuple[int, int], list[int]] = defaultdict(list)
+
+    for i, c in enumerate(ordered):
+        x = xs[i]
+        y = ys[i]
+        cx = int(math.floor(x / cell_size))
+        cy = int(math.floor(y / cell_size))
+        for nx in range(cx - 1, cx + 2):
+            for ny in range(cy - 1, cy + 2):
+                for j in grid.get((nx, ny), []):
+                    if abs(x - xs[j]) > radius_m or abs(y - ys[j]) > radius_m:
                         continue
-                    features.append(
-                        {
-                            "type": "Feature",
-                            "properties": f.get("properties") or {},
-                            "geometry": {"type": "LineString", "coordinates": clipped},
-                        }
-                    )
-    ensure_dir(target.parent)
-    write_json(target, {"type": "FeatureCollection", "features": features})
-    return target
+                    d_m = haversine_km(float(c["lat"]), float(c["lon"]), float(ordered[j]["lat"]), float(ordered[j]["lon"])) * 1000.0
+                    if d_m <= radius_m:
+                        union(i, j)
+        grid[(cx, cy)].append(i)
 
+    members_by_root: dict[int, list[int]] = defaultdict(list)
+    for idx in range(len(ordered)):
+        members_by_root[find(idx)].append(idx)
 
-def _fetch_motorways_geojson_from_overpass(cfg: AppConfig, out_geojson: Path) -> None:
-    query = _overpass_query(cfg)
-    errors: list[str] = []
-    payload = None
-    print("[pipeline] overpass fetching motorways (single query)...", flush=True)
-    for endpoint in cfg.overpass.endpoints:
-        for attempt in range(1, cfg.overpass.retries_per_endpoint + 1):
-            try:
-                resp = requests.post(
-                    endpoint,
-                    data=query,
-                    timeout=cfg.overpass.timeout_seconds + 20,
-                    headers={
-                        "User-Agent": "hpc-map/0.1",
-                        "Content-Type": "text/plain; charset=utf-8",
-                    },
-                )
-                if resp.status_code >= 400:
-                    resp = requests.post(
-                        endpoint,
-                        data={"data": query},
-                        timeout=cfg.overpass.timeout_seconds + 20,
-                        headers={"User-Agent": "hpc-map/0.1"},
-                    )
-                resp.raise_for_status()
-                payload = resp.json()
-                print(f"[pipeline] overpass fetch succeeded via {endpoint}", flush=True)
-                break
-            except Exception as exc:
-                detail = ""
-                try:
-                    text = (resp.text or "").strip()[:240]  # type: ignore[name-defined]
-                    if text:
-                        detail = f" | body={text}"
-                except Exception:
-                    detail = ""
-                errors.append(f"{endpoint} attempt {attempt}: {exc}{detail}")
-                if attempt < cfg.overpass.retries_per_endpoint:
-                    time.sleep(cfg.overpass.retry_backoff_seconds * attempt)
-        if payload is not None:
-            break
-    if payload is None:
-        raise StageError(f"Overpass fetch failed: {' | '.join(errors)}")
-
-    features_by_way: dict[int, dict[str, Any]] = {}
-    for element in payload.get("elements", []):
-        if element.get("type") != "way":
-            continue
-        way_id = element.get("id")
-        if not way_id:
-            continue
-        geom = element.get("geometry") or []
-        if len(geom) < 2:
-            continue
-        coords = [[p["lon"], p["lat"]] for p in geom if "lon" in p and "lat" in p]
-        if len(coords) < 2:
-            continue
-        feature = {
-            "type": "Feature",
-            "properties": {
-                "osm_way_id": way_id,
-                "highway": (element.get("tags") or {}).get("highway", ""),
-                "oneway": (element.get("tags") or {}).get("oneway", ""),
-            },
-            "geometry": {"type": "LineString", "coordinates": coords},
-        }
-        prev = features_by_way.get(int(way_id))
-        if prev is None or len(coords) > len((prev.get("geometry") or {}).get("coordinates", [])):
-            features_by_way[int(way_id)] = feature
-
-    features = list(features_by_way.values())
-    print(f"[pipeline] overpass returned {len(features)} motorway ways", flush=True)
-    ensure_dir(out_geojson.parent)
-    write_json(out_geojson, {"type": "FeatureCollection", "features": features})
-
-
-def _load_germany_country_polygon(root: Path):
-    if LineString is None or shape is None:
-        raise StageError("Missing shapely dependency for Germany clipping.")
-
-    cache = root / "data" / "raw" / "osm" / "germany_country_polygon.geojson"
-    if cache.exists():
-        return shape(read_json(cache))
-
-    countries_path = root / "data" / "raw" / "osm" / "countries.geojson"
-    if not countries_path.exists():
-        url = "https://raw.githubusercontent.com/datasets/geo-countries/master/data/countries.geojson"
-        resp = requests.get(url, timeout=90, headers={"User-Agent": "hpc-map/0.1"})
-        resp.raise_for_status()
-        ensure_dir(countries_path.parent)
-        countries_path.write_text(resp.text, encoding="utf-8")
-
-    fc = read_json(countries_path)
-    for f in fc.get("features", []):
-        props = f.get("properties") or {}
-        a3 = str(props.get("ISO_A3") or props.get("ADM0_A3") or "").upper()
-        name = str(props.get("ADMIN") or props.get("name") or "").lower()
-        if a3 == "DEU" or name == "germany":
-            geom = f.get("geometry")
-            if not geom:
+    out: list[dict[str, Any]] = []
+    for members in members_by_root.values():
+        best_idx = members[0]
+        for idx in members[1:]:
+            best = ordered[best_idx]
+            cand = ordered[idx]
+            best_power = float(best.get("power_kw", 0.0))
+            cand_power = float(cand.get("power_kw", 0.0))
+            if cand_power > best_power:
+                best_idx = idx
                 continue
-            ensure_dir(cache.parent)
-            write_json(cache, geom)
-            return shape(geom)
-    raise StageError("Germany polygon not found in countries dataset.")
+            if cand_power == best_power and str(cand["charger_id"]) < str(best["charger_id"]):
+                best_idx = idx
+        representative = dict(ordered[best_idx])
+        representative["site_size"] = len(members)
+        out.append(representative)
 
-
-def _clip_linestring_to_germany(coords: list[list[float]], germany_polygon) -> list[list[list[float]]]:
-    if not coords or len(coords) < 2:
-        return []
-    try:
-        line = LineString(coords)
-        inter = line.intersection(germany_polygon)
-    except Exception:
-        return []
-
-    out: list[list[list[float]]] = []
-    gtype = inter.geom_type
-    if gtype == "LineString":
-        out.append([[float(x), float(y)] for x, y in inter.coords])
-        return out
-    if gtype == "MultiLineString":
-        for part in inter.geoms:
-            out.append([[float(x), float(y)] for x, y in part.coords])
-        return out
-    if gtype == "GeometryCollection":
-        for part in inter.geoms:
-            if part.geom_type == "LineString":
-                out.append([[float(x), float(y)] for x, y in part.coords])
-            elif part.geom_type == "MultiLineString":
-                for sub in part.geoms:
-                    out.append([[float(x), float(y)] for x, y in sub.coords])
+    out.sort(key=lambda c: str(c["charger_id"]))
     return out
 
 
-def stage_sample_points(cfg: AppConfig, root: Path, motorways_path: Path) -> Path:
-    target = root / cfg.paths.intermediate_dir / "02_directional_sample_points.json"
-    if target.exists():
-        existing = read_json(target).get("points", [])
-        if existing:
-            return target
-    data = read_json(motorways_path)
-    points: list[dict[str, Any]] = []
-    way_index = 0
-    for f in data.get("features", []):
-        props = f.get("properties") or {}
-        line = (f.get("geometry") or {}).get("coordinates", [])
-        sampled = sample_polyline(line, cfg.sampling_interval_m)
-        if len(sampled) < 2:
-            continue
-        cumulative_m = [0.0]
-        for i in range(1, len(sampled)):
-            prev = sampled[i - 1]
-            curr = sampled[i]
-            cumulative_m.append(cumulative_m[-1] + haversine_km(prev[1], prev[0], curr[1], curr[0]) * 1000.0)
-        # Avoid doubling one-way carriageways: use a single geometry.
-        # For true bidirectional centerlines we keep both sides.
-        oneway_raw = str(props.get("oneway", "")).strip().lower()
-        highway = str(props.get("highway", "")).strip().lower()
-        is_oneway = (
-            oneway_raw in {"yes", "1", "true", "-1"}
-            or (highway == "motorway" and oneway_raw not in {"no", "0", "false"})
-        )
-        sides = [0] if is_oneway else [-1, 1]
-
-        for side in sides:
-            for idx, (lon, lat) in enumerate(sampled):
-                if idx == 0:
-                    prev_lon, prev_lat = sampled[idx]
-                    next_lon, next_lat = sampled[idx + 1]
-                elif idx == len(sampled) - 1:
-                    prev_lon, prev_lat = sampled[idx - 1]
-                    next_lon, next_lat = sampled[idx]
-                else:
-                    prev_lon, prev_lat = sampled[idx - 1]
-                    next_lon, next_lat = sampled[idx + 1]
-                if side == 0:
-                    off_lon, off_lat = lon, lat
-                else:
-                    off_lon, off_lat = offset_point_from_heading(
-                        prev_lon, prev_lat, next_lon, next_lat, lon, lat, cfg.directional_offset_m, side
-                    )
-                points.append(
-                    {
-                        "id": f"w{way_index}_s{side}_{idx}",
-                        "way_id": f"w{way_index}",
-                        "osm_way_id": props.get("osm_way_id"),
-                        "oneway": oneway_raw,
-                        "side": side,
-                        "seq": idx,
-                        "along_m": cumulative_m[idx],
-                        "lon": off_lon,
-                        "lat": off_lat,
-                        "centerline_lon": lon,
-                        "centerline_lat": lat,
-                        "offset_m": cfg.directional_offset_m,
-                    }
-                )
-        way_index += 1
-    ensure_dir(target.parent)
-    write_json(target, {"points": points})
-    return target
-
-
-def stage_normalize_chargers(cfg: AppConfig, root: Path) -> tuple[Path, Path]:
+def stage_normalize_chargers(cfg: AppConfig, root: Path, threshold_kw: float) -> tuple[Path, Path]:
     raw_csv = root / cfg.paths.bnetza_csv
     if not raw_csv.exists():
         raise StageError(f"Missing charger CSV: {raw_csv}")
-    checksum_path = root / cfg.paths.intermediate_dir / "03_charger_checksum.json"
-    out_path = root / cfg.paths.intermediate_dir / "03_eligible_chargers.json"
 
     checksum = checksum_file(raw_csv)
+    checksum_path = root / cfg.paths.intermediate_dir / "03_charger_checksum.json"
+    out_path = _intermediate_path(cfg, root, "03_eligible_chargers", threshold_kw)
+
     if checksum_path.exists() and out_path.exists():
         old = read_json(checksum_path)
         if old.get("sha256") == checksum and int(old.get("normalize_stage_version", 0)) == NORMALIZE_STAGE_VERSION:
@@ -395,7 +163,7 @@ def stage_normalize_chargers(cfg: AppConfig, root: Path) -> tuple[Path, Path]:
     if header_idx is None:
         raise StageError("Could not detect BNetzA CSV header row")
 
-    dedup: dict[str, dict[str, Any]] = {}
+    by_id: dict[str, dict[str, Any]] = {}
     with io.StringIO("\n".join(lines[header_idx:])) as handle:
         reader = csv.DictReader(handle, delimiter=";")
         for row in reader:
@@ -411,9 +179,10 @@ def stage_normalize_chargers(cfg: AppConfig, root: Path) -> tuple[Path, Path]:
                 power = float(power_raw)
             except ValueError:
                 continue
-            if power < cfg.min_power_kw:
+            if power < threshold_kw:
                 continue
-            dedup[charger_id] = {
+
+            current = {
                 "charger_id": charger_id,
                 "lat": lat,
                 "lon": lon,
@@ -421,10 +190,30 @@ def stage_normalize_chargers(cfg: AppConfig, root: Path) -> tuple[Path, Path]:
                 "operator": (row.get("Betreiber") or "").strip(),
                 "status": (row.get("Status") or "").strip(),
             }
-    if not dedup:
+            prev = by_id.get(charger_id)
+            if prev is None:
+                by_id[charger_id] = current
+                continue
+            if float(current["power_kw"]) > float(prev.get("power_kw", 0.0)):
+                by_id[charger_id] = current
+
+    if not by_id:
         raise StageError("No eligible chargers after filtering.")
+
+    clustered = _cluster_chargers_within_radius(list(by_id.values()), CHARGER_CLUSTER_RADIUS_M)
+
     ensure_dir(out_path.parent)
-    write_json(out_path, {"chargers": list(dedup.values())})
+    write_json(
+        out_path,
+        {
+            "chargers": clustered,
+            "stats": {
+                "input_records_after_id_dedupe": len(by_id),
+                "site_representatives": len(clustered),
+                "cluster_radius_m": CHARGER_CLUSTER_RADIUS_M,
+            },
+        },
+    )
     write_json(
         checksum_path,
         {
@@ -436,769 +225,67 @@ def stage_normalize_chargers(cfg: AppConfig, root: Path) -> tuple[Path, Path]:
     return out_path, checksum_path
 
 
-def stage_preselect_candidates(cfg: AppConfig, root: Path, points_path: Path, chargers_path: Path) -> Path:
-    target = root / cfg.paths.intermediate_dir / "04_preselected_candidates.json"
-    if target.exists():
-        existing = read_json(target).get("preselected", [])
+def stage_run_distance_core(cfg: AppConfig, root: Path, chargers_path: Path, threshold_kw: float) -> tuple[Path, Path]:
+    segments_path = _processed_geojson_path(cfg, root, "hpc_distance_segments", threshold_kw)
+    stats_path = _distance_core_stats_path(cfg, root, threshold_kw)
+
+    if segments_path.exists() and stats_path.exists():
+        existing = read_json(segments_path).get("features", [])
         if existing:
-            return target
-    points = read_json(points_path).get("points", [])
-    chargers = read_json(chargers_path).get("chargers", [])
-    min_lon, min_lat, max_lon, max_lat = _candidate_bbox(cfg)
-    chargers = [c for c in chargers if min_lon <= c["lon"] <= max_lon and min_lat <= c["lat"] <= max_lat]
-    if not chargers:
-        raise StageError("No eligible chargers in candidate bbox.")
+            return segments_path, stats_path
 
-    if BallTree is not None:
-        rows = _preselect_candidates_balltree(cfg, points, chargers)
-        ensure_dir(target.parent)
-        write_json(target, {"preselected": rows})
-        return target
+    ensure_dir(segments_path.parent)
+    ensure_dir(stats_path.parent)
 
-    print("[pipeline] preselect_candidates using grid fallback (BallTree unavailable)", flush=True)
-    rows = _preselect_candidates_grid(cfg, points, chargers)
-    ensure_dir(target.parent)
-    write_json(target, {"preselected": rows})
-    return target
+    command = cfg.distance_core_command()
+    if not command:
+        raise StageError("distance_core.command must not be empty")
 
-
-def _preselect_candidates_balltree(cfg: AppConfig, points: list[dict[str, Any]], chargers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    earth_radius_km = 6371.0088
-    max_air_km = cfg.preselection.max_air_km
-    candidate_count = max(1, min(cfg.preselection.count, len(chargers)))
-    batch_size = 20000
-
-    charger_rad = [
-        [math.radians(c["lat"]), math.radians(c["lon"])]
-        for c in chargers
+    cmd = [
+        *command,
+        "--graph-cache",
+        str((root / cfg.distance_core.graph_cache_path).resolve()),
+        "--chargers-json",
+        str(chargers_path.resolve()),
+        "--threshold-kw",
+        str(float(threshold_kw)),
+        "--segment-length-m",
+        str(float(cfg.distance_core.segment_length_m)),
+        "--road-class",
+        str(cfg.distance_core.road_class),
+        "--objective",
+        str(cfg.distance_core.objective),
+        "--drop-unsnappable",
+        "true" if cfg.distance_core.drop_unsnappable else "false",
+        "--out-segments-geojson",
+        str(segments_path.resolve()),
+        "--out-stats-json",
+        str(stats_path.resolve()),
     ]
-    tree = BallTree(charger_rad, metric="haversine")
 
-    rows: list[dict[str, Any]] = []
-    total = len(points)
-    for start in range(0, total, batch_size):
-        end = min(start + batch_size, total)
-        point_batch = points[start:end]
-        point_rad = [
-            [math.radians(p["lat"]), math.radians(p["lon"])]
-            for p in point_batch
-        ]
-        distances_rad, indices = tree.query(point_rad, k=candidate_count)
-        for idx, p in enumerate(point_batch):
-            candidates = []
-            for dist_rad, charger_idx in zip(distances_rad[idx], indices[idx]):
-                km = float(dist_rad) * earth_radius_km
-                if km <= max_air_km:
-                    candidates.append(chargers[int(charger_idx)])
-            rows.append({"point_id": p["id"], "candidates": candidates})
-        if end % 100000 == 0 or end == total:
-            print(f"[pipeline] preselect_candidates progress {end}/{total}", flush=True)
-    return rows
-
-
-def _preselect_candidates_grid(cfg: AppConfig, points: list[dict[str, Any]], chargers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    ref_lat = (cfg.subset_bbox.min_lat + cfg.subset_bbox.max_lat) / 2.0
-    km_per_lon = 111.320 * max(math.cos(math.radians(ref_lat)), 1e-6)
-    km_per_lat = 110.574
-    cell_km = cfg.preselection.grid_cell_km
-
-    def grid_key(lat: float, lon: float) -> tuple[int, int]:
-        x_km = lon * km_per_lon
-        y_km = lat * km_per_lat
-        return int(math.floor(x_km / cell_km)), int(math.floor(y_km / cell_km))
-
-    grid: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
-    for c in chargers:
-        grid[grid_key(c["lat"], c["lon"])].append(c)
-
-    cell_radius = max(1, int(math.ceil(cfg.preselection.max_air_km / cell_km)))
-    rows = []
-    for p in points:
-        ranked = []
-        cx, cy = grid_key(p["lat"], p["lon"])
-        for dx in range(-cell_radius, cell_radius + 1):
-            for dy in range(-cell_radius, cell_radius + 1):
-                for c in grid.get((cx + dx, cy + dy), []):
-                    air_km = haversine_km(p["lat"], p["lon"], c["lat"], c["lon"])
-                    if air_km <= cfg.preselection.max_air_km:
-                        ranked.append((air_km, c))
-        ranked.sort(key=lambda t: t[0])
-        rows.append({"point_id": p["id"], "candidates": [c for _, c in ranked[: cfg.preselection.count]]})
-    return rows
-
-
-def _normalize_bearing_deg(deg: float) -> float:
-    return (deg + 360.0) % 360.0
-
-
-def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dlambda = math.radians(lon2 - lon1)
-    y = math.sin(dlambda) * math.cos(phi2)
-    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlambda)
-    return _normalize_bearing_deg(math.degrees(math.atan2(y, x)))
-
-
-def _heading_diff_deg(a: float, b: float) -> float:
-    d = abs(_normalize_bearing_deg(a) - _normalize_bearing_deg(b))
-    return min(d, 360.0 - d)
-
-
-def _build_point_heading_index(points: list[dict[str, Any]]) -> dict[str, float]:
-    grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
-    for p in points:
-        grouped[(str(p["way_id"]), int(p.get("side", 0)))].append(p)
-
-    headings: dict[str, float] = {}
-    for (_, side), arr in grouped.items():
-        arr.sort(key=lambda x: int(x.get("seq", 0)))
-        n = len(arr)
-        if n < 2:
-            continue
-        for i, p in enumerate(arr):
-            if i < n - 1:
-                p2 = arr[i + 1]
-                base_heading = _bearing_deg(float(p["lat"]), float(p["lon"]), float(p2["lat"]), float(p2["lon"]))
-            else:
-                p1 = arr[i - 1]
-                base_heading = _bearing_deg(float(p1["lat"]), float(p1["lon"]), float(p["lat"]), float(p["lon"]))
-
-            oneway = str(p.get("oneway", "")).strip().lower()
-            if side == -1 or (side == 0 and oneway == "-1"):
-                travel_heading = _normalize_bearing_deg(base_heading + 180.0)
-            else:
-                travel_heading = base_heading
-            headings[str(p["id"])] = travel_heading
-    return headings
-
-
-def _extract_route_km_with_heading_validation(body: dict[str, Any], expected_heading_deg: float, max_diff_deg: float) -> float | None:
-    paths = body.get("paths") or []
-    if not paths:
-        return None
-    first = paths[0]
-    meters = first.get("distance")
-    if meters is None:
-        return None
-
-    points_obj = first.get("points") or {}
-    coords = points_obj.get("coordinates") or []
-    if len(coords) >= 2:
-        # GeoJSON coordinates are [lon, lat].
-        obs_heading = _bearing_deg(float(coords[0][1]), float(coords[0][0]), float(coords[1][1]), float(coords[1][0]))
-        if _heading_diff_deg(obs_heading, expected_heading_deg) > max_diff_deg:
-            return None
-
-    return float(meters) / 1000.0
-
-
-def _graphhopper_route_km_heading(cfg: AppConfig, lat1: float, lon1: float, lat2: float, lon2: float, heading_deg: float) -> float | None:
-    return _graphhopper_route_km_heading_session(cfg, requests, lat1, lon1, lat2, lon2, heading_deg)
-
-
-def _graphhopper_route_km_heading_session(cfg: AppConfig, session: Any, lat1: float, lon1: float, lat2: float, lon2: float, heading_deg: float) -> float | None:
-    retries = int(cfg.routing.graphhopper_exact.request_retries)
-    backoff = float(cfg.routing.graphhopper_exact.request_backoff_seconds)
-
-    for attempt in range(retries + 1):
-        try:
-            params: list[tuple[str, str]] = [
-                ("profile", "car"),
-                ("point", f"{lat1},{lon1}"),
-                ("point", f"{lat2},{lon2}"),
-                ("instructions", "false"),
-                ("calc_points", "false"),
-            ]
-            resp = session.get(
-                f"{cfg.routing.graphhopper_base_url}/route",
-                params=params,
-                timeout=cfg.routing.route_timeout_seconds,
-            )
-            resp.raise_for_status()
-            body = resp.json()
-            paths = body.get("paths") or []
-            if not paths:
-                return None
-            meters = paths[0].get("distance")
-            if meters is None:
-                return None
-            return float(meters) / 1000.0
-        except Exception:
-            pass
-        if attempt < retries:
-            time.sleep(backoff * (attempt + 1))
-    return None
-
-
-def stage_route_distances(cfg: AppConfig, root: Path, points_path: Path, preselected_path: Path | None) -> Path:
-    target = root / cfg.paths.intermediate_dir / "05_route_distances.json"
-    if target.exists():
-        existing = read_json(target).get("routes", [])
-        if existing:
-            return target
-    mode = (cfg.routing.distance_mode or "euclidean").lower().strip()
-    if mode not in {"euclidean", "graphhopper", "exit_based"}:
-        raise StageError("routing.distance_mode must be one of: euclidean, graphhopper, exit_based")
-    if mode == "graphhopper":
-        if cfg.routing.provider != "graphhopper":
-            raise StageError("routing.provider must be graphhopper when routing.distance_mode=graphhopper")
-        _ensure_graphhopper_available(cfg)
-    if mode == "exit_based":
-        return _stage_route_distances_exit_based(cfg, root, points_path)
-
-    points = {p["id"]: p for p in read_json(points_path).get("points", [])}
-    if mode == "graphhopper" and cfg.routing.graphhopper_exact.enabled:
-        return _stage_route_distances_graphhopper_exact(cfg, root, points_path)
-    if preselected_path is None:
-        raise StageError("preselect_candidates output is required for euclidean/legacy graphhopper mode")
-    preselected = read_json(preselected_path).get("preselected", [])
-    out = []
-    total = len(preselected)
-    completed = 0
-    failures = 0
-
-    def process_row(row: dict[str, Any]) -> dict[str, Any] | None:
-        pid = row["point_id"]
-        point = points.get(pid)
-        if not point:
-            return None
-        best_km = None
-        best = None
-        for cand in row.get("candidates", []):
-            try:
-                if mode == "euclidean":
-                    km = haversine_km(point["lat"], point["lon"], cand["lat"], cand["lon"])
-                else:
-                    km = _graphhopper_route_km(cfg, point["lat"], point["lon"], cand["lat"], cand["lon"])
-            except Exception:
-                continue
-            if best_km is None or km < best_km:
-                best_km = km
-                best = cand
-        if best_km is None or best is None:
-            return None
-        return {
-            "point_id": pid,
-            "distance_km": best_km,
-            "charger_id": best["charger_id"],
-            "power_kw": best["power_kw"],
-        }
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.routing.max_workers) as pool:
-        futures = [pool.submit(process_row, row) for row in preselected]
-        for fut in concurrent.futures.as_completed(futures):
-            completed += 1
-            res = fut.result()
-            if res is None:
-                failures += 1
-            else:
-                out.append(res)
-            if completed % max(cfg.routing.progress_every_points, 1) == 0:
-                print(
-                    f"[pipeline] route_distances progress {completed}/{total} (ok={len(out)} fail={failures})",
-                    flush=True,
-                )
-
-    if not out:
-        raise StageError("No routes computed from GraphHopper.")
-    ensure_dir(target.parent)
-    write_json(target, {"routes": out})
-    return target
-
-
-def _stage_route_distances_graphhopper_exact(cfg: AppConfig, root: Path, points_path: Path) -> Path:
-    if BallTree is None:
-        raise StageError("routing.distance_mode=graphhopper exact mode requires scikit-learn BallTree.")
-
-    target = root / cfg.paths.intermediate_dir / "05_route_distances.json"
-    points = read_json(points_path).get("points", [])
-    if not points:
-        raise StageError("No sampled points available.")
-    chargers = read_json(root / cfg.paths.intermediate_dir / "03_eligible_chargers.json").get("chargers", [])
-    if not chargers:
-        raise StageError("No eligible chargers available.")
-
-    headings = _build_point_heading_index(points)
-    charger_rad = [[math.radians(c["lat"]), math.radians(c["lon"])] for c in chargers]
-    tree = BallTree(charger_rad, metric="haversine")
-    earth_radius_km = 6371.0088
-    max_candidates = min(int(cfg.routing.graphhopper_exact.max_candidates_per_point), len(chargers))
-    if max_candidates < 1:
-        raise StageError("routing.graphhopper_exact.max_candidates_per_point must be >= 1")
-    initial_batch = min(max(1, int(cfg.routing.graphhopper_exact.initial_candidate_batch)), max_candidates)
-
-    # Group points by (way_id, side) and sort each group by seq.
-    # This enables the warm-start optimisation: the previous point's winning
-    # charger is tried first, which often resolves in a single GH call on
-    # long straight motorway segments.
-    grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
-    for p in points:
-        grouped[(str(p["way_id"]), int(p.get("side", 0)))].append(p)
-    for arr in grouped.values():
-        arr.sort(key=lambda x: int(x.get("seq", 0)))
-    way_groups = list(grouped.values())
-    total = len(points)
-
-    routes: list[dict[str, Any]] = []
-    failures = 0
-    capped = 0
-    completed = 0
-    total_gh_calls = 0
-    total_gh_ms = 0.0
-    lock = threading.Lock()
-    t_start = time.perf_counter()
-
-    def process_way_group(group: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, float]:
-        # Each group runs in its own thread with its own HTTP session.
-        session = requests.Session()
-        group_routes: list[dict[str, Any]] = []
-        prev_winner_idx: int | None = None  # charger index of previous point's winner
-        gh_calls = 0
-        gh_ms = 0.0
-
-        for point in group:
-            heading = headings.get(str(point["id"]))
-            if heading is None:
-                continue
-            point_rad = [[math.radians(point["lat"]), math.radians(point["lon"])]]
-            tested: set[int] = set()
-            best_route_km: float | None = None
-            best_charger: dict[str, Any] | None = None
-            best_charger_idx: int | None = None
-            reached_cap_without_proof = False
-
-            # Warm start: try the previous winner first.
-            if prev_winner_idx is not None:
-                cand = chargers[prev_winner_idx]
-                _t0 = time.perf_counter()
-                routed_km = _graphhopper_route_km_heading_session(
-                    cfg, session,
-                    float(point["lat"]), float(point["lon"]),
-                    float(cand["lat"]), float(cand["lon"]),
-                    heading,
-                )
-                gh_calls += 1
-                gh_ms += (time.perf_counter() - _t0) * 1000
-                tested.add(prev_winner_idx)
-                if routed_km is not None:
-                    best_route_km = routed_km
-                    best_charger = cand
-                    best_charger_idx = prev_winner_idx
-
-            # BallTree expansion loop (skipped entirely if warm start already proved optimal).
-            k = initial_batch
-            while True:
-                dist_rad, idx_arr = tree.query(point_rad, k=k)
-                distances = dist_rad[0]
-                indices = idx_arr[0]
-
-                # Check stopping condition before routing new candidates.
-                kth_air_km = float(distances[-1]) * earth_radius_km
-                if best_route_km is not None and kth_air_km >= best_route_km:
-                    break
-
-                for dr, idx in zip(distances, indices):
-                    # Early exit: air distance already exceeds best road distance found.
-                    if best_route_km is not None and float(dr) * earth_radius_km >= best_route_km:
-                        break
-                    i = int(idx)
-                    if i in tested:
-                        continue
-                    tested.add(i)
-                    candidate = chargers[i]
-                    _t0 = time.perf_counter()
-                    routed_km = _graphhopper_route_km_heading_session(
-                        cfg, session,
-                        float(point["lat"]), float(point["lon"]),
-                        float(candidate["lat"]), float(candidate["lon"]),
-                        heading,
-                    )
-                    gh_calls += 1
-                    gh_ms += (time.perf_counter() - _t0) * 1000
-                    if routed_km is None:
-                        continue
-                    if best_route_km is None or routed_km < best_route_km:
-                        best_route_km = routed_km
-                        best_charger = candidate
-                        best_charger_idx = i
-
-                kth_air_km = float(distances[-1]) * earth_radius_km
-                if best_route_km is not None and kth_air_km >= best_route_km:
-                    break
-                if k >= max_candidates:
-                    reached_cap_without_proof = best_route_km is not None and max_candidates < len(chargers)
-                    break
-                k = min(k * 2, max_candidates)
-
-            if best_route_km is None or best_charger is None:
-                prev_winner_idx = None
-                continue
-
-            prev_winner_idx = best_charger_idx
-            group_routes.append({
-                "point_id": point["id"],
-                "distance_km": float(best_route_km),
-                "charger_id": best_charger["charger_id"],
-                "power_kw": best_charger["power_kw"],
-                "_capped": reached_cap_without_proof,
-            })
-
-        return group_routes, gh_calls, gh_ms
-
-    last_log_time = t_start
-    with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.routing.max_workers) as pool:
-        futures = {pool.submit(process_way_group, grp): grp for grp in way_groups}
-        for idx, fut in enumerate(concurrent.futures.as_completed(futures), start=1):
-            group_result, grp_calls, grp_ms = fut.result()
-            with lock:
-                for res in group_result:
-                    if res.pop("_capped", False):
-                        capped += 1
-                    routes.append(res)
-                completed += len(futures[fut])
-                failures += len(futures[fut]) - len(group_result)
-                total_gh_calls += grp_calls
-                total_gh_ms += grp_ms
-            now_t = time.perf_counter()
-            time_since_log = now_t - last_log_time
-            if idx % max(1, cfg.routing.progress_every_points // 10) == 0 or time_since_log >= 60:
-                with lock:
-                    _ok = len(routes)
-                    _fail = failures
-                    _calls = total_gh_calls
-                    _ms = total_gh_ms
-                elapsed = time.perf_counter() - t_start
-                pts_per_sec = completed / elapsed if elapsed > 0 else 0
-                eta_s = (total - completed) / pts_per_sec if pts_per_sec > 0 else 0
-                avg_ms = (_ms / _calls) if _calls > 0 else 0
-                calls_per_pt = (_calls / _ok) if _ok > 0 else 0
-                now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                print(
-                    f"[pipeline] [{now}] route_distances ways={idx}/{len(way_groups)} pts={completed}/{total} "
-                    f"ok={_ok} fail={_fail} | {pts_per_sec:.1f}pt/s ETA={eta_s/60:.0f}min | "
-                    f"GH calls={_calls} avg={avg_ms:.0f}ms/call calls/pt={calls_per_pt:.1f}",
-                    flush=True,
-                )
-                last_log_time = now_t
-
-    if capped > 0:
-        raise StageError(
-            f"GraphHopper exact mode hit max_candidates_per_point for {capped} points; "
-            "increase routing.graphhopper_exact.max_candidates_per_point for exact guarantees."
-        )
-    if not routes:
-        raise StageError("No routes computed from GraphHopper exact mode.")
-    ensure_dir(target.parent)
-    write_json(target, {"routes": routes})
-    return target
-
-
-def _stage_route_distances_exit_based(cfg: AppConfig, root: Path, points_path: Path) -> Path:
-    if BallTree is None:
-        raise StageError("routing.distance_mode=exit_based requires scikit-learn BallTree.")
-
-    target = root / cfg.paths.intermediate_dir / "05_route_distances.json"
-    points = read_json(points_path).get("points", [])
-    if not points:
-        raise StageError("No sampled points available for exit_based mode.")
-
-    exits = _fetch_motorway_exits(cfg, root)
-    if not exits:
-        raise StageError("No motorway exits found in bbox for exit_based mode.")
-
-    # Assign exits to the nearest sampled motorway point, inheriting way and along-distance.
-    point_rad = [[math.radians(p["lat"]), math.radians(p["lon"])] for p in points]
-    point_tree = BallTree(point_rad, metric="haversine")
-    exit_rad = [[math.radians(e["lat"]), math.radians(e["lon"])] for e in exits]
-    _, nearest_idx = point_tree.query(exit_rad, k=1)
-
-    exits_by_way: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for e_idx, e in enumerate(exits):
-        p = points[int(nearest_idx[e_idx][0])]
-        way_id = str(p["way_id"])
-        exits_by_way[way_id].append(
-            {
-                "exit_id": e["id"],
-                "lat": e["lat"],
-                "lon": e["lon"],
-                "along_m": float(p.get("along_m", 0.0)),
-            }
-        )
-
-    for arr in exits_by_way.values():
-        arr.sort(key=lambda x: x["along_m"])
-
-    chargers = read_json(root / cfg.paths.intermediate_dir / "03_eligible_chargers.json").get("chargers", [])
-    if not chargers:
-        raise StageError("No eligible chargers available for exit_based mode.")
-    charger_rad = [[math.radians(c["lat"]), math.radians(c["lon"])] for c in chargers]
-    charger_tree = BallTree(charger_rad, metric="haversine")
-    exit_rad = [[math.radians(e["lat"]), math.radians(e["lon"])] for e in exits]
-    dist_rad, ch_idx = charger_tree.query(exit_rad, k=1)
-    exit_tree = BallTree(exit_rad, metric="haversine")
-    earth_radius_km = 6371.0088
-    exit_to_hpc: dict[str, dict[str, Any]] = {}
-    for i, e in enumerate(exits):
-        c = chargers[int(ch_idx[i][0])]
-        exit_to_hpc[e["id"]] = {
-            "distance_km": float(dist_rad[i][0]) * earth_radius_km,
-            "charger_id": c["charger_id"],
-            "power_kw": c["power_kw"],
-        }
-
-    def forward_direction(point: dict[str, Any]) -> bool:
-        side = int(point.get("side", 0))
-        oneway = str(point.get("oneway", "")).strip().lower()
-        if side == 0:
-            return oneway != "-1"
-        return side == 1
-
-    routes = []
-    failures = 0
-    fallback_used = 0
-    total = len(points)
-    for idx, p in enumerate(points, start=1):
-        way_exits = exits_by_way.get(str(p["way_id"]), [])
-        if not way_exits:
-            nearest_exit = _nearest_exit_for_point(exit_tree, exits, p)
-            if nearest_exit is None:
-                failures += 1
-                continue
-            hpc = exit_to_hpc.get(nearest_exit["id"])
-            if hpc is None:
-                failures += 1
-                continue
-            fallback_used += 1
-            routes.append(
-                {
-                    "point_id": p["id"],
-                    "distance_km": haversine_km(p["lat"], p["lon"], nearest_exit["lat"], nearest_exit["lon"])
-                    + float(hpc["distance_km"]),
-                    "charger_id": hpc["charger_id"],
-                    "power_kw": hpc["power_kw"],
-                }
-            )
-            continue
-        along = float(p.get("along_m", 0.0))
-        exit_choice = None
-        if forward_direction(p):
-            for ex in way_exits:
-                if ex["along_m"] >= along:
-                    exit_choice = ex
-                    break
-        else:
-            for ex in reversed(way_exits):
-                if ex["along_m"] <= along:
-                    exit_choice = ex
-                    break
-        if exit_choice is None:
-            nearest_exit = _nearest_exit_for_point(exit_tree, exits, p)
-            if nearest_exit is None:
-                failures += 1
-                continue
-            hpc = exit_to_hpc.get(nearest_exit["id"])
-            if hpc is None:
-                failures += 1
-                continue
-            fallback_used += 1
-            routes.append(
-                {
-                    "point_id": p["id"],
-                    "distance_km": haversine_km(p["lat"], p["lon"], nearest_exit["lat"], nearest_exit["lon"])
-                    + float(hpc["distance_km"]),
-                    "charger_id": hpc["charger_id"],
-                    "power_kw": hpc["power_kw"],
-                }
-            )
-            continue
-        hpc = exit_to_hpc.get(exit_choice["exit_id"])
-        if hpc is None:
-            nearest_exit = _nearest_exit_for_point(exit_tree, exits, p)
-            if nearest_exit is None:
-                failures += 1
-                continue
-            hpc2 = exit_to_hpc.get(nearest_exit["id"])
-            if hpc2 is None:
-                failures += 1
-                continue
-            fallback_used += 1
-            routes.append(
-                {
-                    "point_id": p["id"],
-                    "distance_km": haversine_km(p["lat"], p["lon"], nearest_exit["lat"], nearest_exit["lon"])
-                    + float(hpc2["distance_km"]),
-                    "charger_id": hpc2["charger_id"],
-                    "power_kw": hpc2["power_kw"],
-                }
-            )
-            continue
-        distance_to_exit_km = abs(float(exit_choice["along_m"]) - along) / 1000.0
-        routes.append(
-            {
-                "point_id": p["id"],
-                "distance_km": distance_to_exit_km + float(hpc["distance_km"]),
-                "charger_id": hpc["charger_id"],
-                "power_kw": hpc["power_kw"],
-            }
-        )
-        if idx % max(cfg.routing.progress_every_points, 1) == 0:
-            print(
-                f"[pipeline] route_distances progress {idx}/{total} (ok={len(routes)} fail={failures} fallback={fallback_used})",
-                flush=True,
-            )
-
-    if not routes:
-        raise StageError("No distances computed for exit_based mode.")
-    print(f"[pipeline] exit_based fallback_used={fallback_used}", flush=True)
-    ensure_dir(target.parent)
-    write_json(target, {"routes": routes})
-    return target
-
-
-def _nearest_exit_for_point(exit_tree: BallTree, exits: list[dict[str, Any]], point: dict[str, Any]) -> dict[str, Any] | None:
-    if not exits:
-        return None
-    p_rad = [[math.radians(point["lat"]), math.radians(point["lon"])]]
-    _, idx = exit_tree.query(p_rad, k=1)
-    return exits[int(idx[0][0])]
-
-
-def _overpass_exits_query(cfg: AppConfig) -> str:
-    b = cfg.subset_bbox
-    return f"""
-[out:json][timeout:{cfg.overpass.timeout_seconds}];
-node["highway"="motorway_junction"]({b.min_lat},{b.min_lon},{b.max_lat},{b.max_lon});
-out body;
-"""
-
-
-def _fetch_motorway_exits(cfg: AppConfig, root: Path) -> list[dict[str, Any]]:
-    path = root / cfg.paths.intermediate_dir / "03b_motorway_exits.json"
-    if path.exists():
-        cached = read_json(path).get("exits", [])
-        if cached:
-            return cached
-
-    query = _overpass_exits_query(cfg)
-    payload = None
-    errors: list[str] = []
-    for endpoint in cfg.overpass.endpoints:
-        for attempt in range(1, cfg.overpass.retries_per_endpoint + 1):
-            try:
-                resp = requests.post(
-                    endpoint,
-                    data=query,
-                    timeout=cfg.overpass.timeout_seconds + 20,
-                    headers={"User-Agent": "hpc-map/0.1", "Content-Type": "text/plain; charset=utf-8"},
-                )
-                if resp.status_code >= 400:
-                    resp = requests.post(
-                        endpoint,
-                        data={"data": query},
-                        timeout=cfg.overpass.timeout_seconds + 20,
-                        headers={"User-Agent": "hpc-map/0.1"},
-                    )
-                resp.raise_for_status()
-                payload = resp.json()
-                break
-            except Exception as exc:
-                errors.append(f"{endpoint} attempt {attempt}: {exc}")
-                if attempt < cfg.overpass.retries_per_endpoint:
-                    time.sleep(cfg.overpass.retry_backoff_seconds * attempt)
-        if payload is not None:
-            break
-    if payload is None:
-        raise StageError(f"Motorway exit fetch failed: {' | '.join(errors[-6:])}")
-
-    exits = []
-    for el in payload.get("elements", []):
-        if el.get("type") != "node":
-            continue
-        lat = el.get("lat")
-        lon = el.get("lon")
-        if lat is None or lon is None:
-            continue
-        exits.append(
-            {
-                "id": str(el.get("id")),
-                "lat": float(lat),
-                "lon": float(lon),
-                "ref": ((el.get("tags") or {}).get("ref") or ""),
-                "name": ((el.get("tags") or {}).get("name") or ""),
-            }
-        )
-    ensure_dir(path.parent)
-    write_json(path, {"exits": exits})
-    return exits
-
-
-def _ensure_graphhopper_available(cfg: AppConfig) -> None:
     try:
-        url = (
-            f"{cfg.routing.graphhopper_base_url}/route?"
-            "profile=car&point=52.5000,13.4000&point=52.5200,13.4500"
-            "&instructions=false&calc_points=false"
-        )
-        resp = requests.get(url, timeout=cfg.routing.route_timeout_seconds)
-        resp.raise_for_status()
-        body = resp.json()
-        _ = float(body["paths"][0]["distance"])
-    except Exception as exc:
-        raise StageError(f"GraphHopper probe failed at {cfg.routing.graphhopper_base_url}: {exc}") from exc
+        proc = subprocess.run(cmd, cwd=root, check=False, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise StageError(
+            "Distance-core command not found. Check config.distance_core.command and ensure Java tooling is installed."
+        ) from exc
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        details = stderr or stdout or "distance-core exited without logs"
+        raise StageError(f"distance-core failed (exit {proc.returncode}): {details[:800]}")
+
+    if not segments_path.exists():
+        raise StageError(f"distance-core did not emit segments: {segments_path}")
+    if not stats_path.exists():
+        raise StageError(f"distance-core did not emit stats: {stats_path}")
+
+    return segments_path, stats_path
 
 
-def _graphhopper_route_km(cfg: AppConfig, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    url = (
-        f"{cfg.routing.graphhopper_base_url}/route?"
-        f"profile=car&point={lat1},{lon1}&point={lat2},{lon2}"
-        "&instructions=false&calc_points=false"
-    )
-    resp = requests.get(url, timeout=cfg.routing.route_timeout_seconds)
-    resp.raise_for_status()
-    body = resp.json()
-    meters = float(body["paths"][0]["distance"])
-    return meters / 1000.0
-
-
-def stage_build_segments(cfg: AppConfig, root: Path, points_path: Path, routes_path: Path) -> Path:
-    target = root / cfg.paths.processed_dir / "hpc_distance_segments.geojson"
-    points = {p["id"]: p for p in read_json(points_path).get("points", [])}
-    routes = {r["point_id"]: r for r in read_json(routes_path).get("routes", [])}
-    grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
-    for p in points.values():
-        grouped[(p["way_id"], p["side"])].append(p)
-    features = []
-    for (way_id, side), arr in grouped.items():
-        arr.sort(key=lambda x: x["seq"])
-        for a, b in zip(arr, arr[1:]):
-            ra = routes.get(a["id"])
-            rb = routes.get(b["id"])
-            if not ra or not rb:
-                continue
-            features.append(
-                {
-                    "type": "Feature",
-                    "properties": {
-                        "way_id": way_id,
-                        "side": side,
-                        "distance_start_km": ra["distance_km"],
-                        "distance_end_km": rb["distance_km"],
-                        "min_power_kw": cfg.min_power_kw,
-                    },
-                    "geometry": {
-                        "type": "LineString",
-                        "coordinates": [[a["lon"], a["lat"]], [b["lon"], b["lat"]]],
-                    },
-                }
-            )
-    ensure_dir(target.parent)
-    write_json(target, {"type": "FeatureCollection", "features": features})
-    return target
-
-
-def stage_build_hpc_points_layer(cfg: AppConfig, root: Path, chargers_path: Path) -> Path:
-    target = root / cfg.paths.processed_dir / "hpc_sites.geojson"
+def stage_build_hpc_points_layer(cfg: AppConfig, root: Path, chargers_path: Path, threshold_kw: float) -> Path:
+    target = _processed_geojson_path(cfg, root, "hpc_sites", threshold_kw)
     chargers = read_json(chargers_path).get("chargers", [])
     features = [
         {
@@ -1208,7 +295,8 @@ def stage_build_hpc_points_layer(cfg: AppConfig, root: Path, chargers_path: Path
                 "power_kw": c["power_kw"],
                 "operator": c.get("operator", ""),
                 "status": c.get("status", ""),
-                "min_power_kw": cfg.min_power_kw,
+                "site_size": c.get("site_size", 1),
+                "min_power_kw": threshold_kw,
             },
             "geometry": {"type": "Point", "coordinates": [c["lon"], c["lat"]]},
         }
@@ -1219,8 +307,8 @@ def stage_build_hpc_points_layer(cfg: AppConfig, root: Path, chargers_path: Path
     return target
 
 
-def stage_generate_mbtiles(cfg: AppConfig, root: Path, segments_path: Path) -> Path:
-    mbtiles = root / cfg.tiles.distance_mbtiles_path
+def stage_generate_mbtiles(cfg: AppConfig, root: Path, segments_path: Path, threshold_kw: float) -> Path:
+    mbtiles = _distance_mbtiles_path(cfg, root, threshold_kw)
     ensure_dir(mbtiles.parent)
     cmd = [
         "tippecanoe",
@@ -1237,62 +325,73 @@ def stage_generate_mbtiles(cfg: AppConfig, root: Path, segments_path: Path) -> P
     ]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except Exception as exc:
-        write_json(
-            root / cfg.paths.processed_dir / "mbtiles_generation_note.json",
-            {
-                "status": "not_generated",
-                "reason": str(exc),
-                "source_geojson": str(segments_path),
-                "target_mbtiles": str(mbtiles),
-            },
-        )
+    except FileNotFoundError as exc:
+        raise StageError(
+            "tippecanoe is required to generate distance MBTiles but was not found. "
+            "Run the pipeline in Docker (`docker compose run --rm --no-deps pipeline`) "
+            "or install tippecanoe locally."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise StageError(
+            f"tippecanoe failed for distance MBTiles ({mbtiles.name}): "
+            f"{(exc.stderr or exc.stdout or '').strip()[:400]}"
+        ) from exc
     return mbtiles
 
 
-def stage_generate_hpc_sites_mbtiles(cfg: AppConfig, root: Path, hpc_points_path: Path) -> Path:
-    mbtiles = root / cfg.tiles.hpc_mbtiles_path
-    ensure_dir(mbtiles.parent)
-    cmd = [
-        "tippecanoe",
-        "-f",
-        "-o",
-        str(mbtiles),
-        "-l",
-        cfg.tiles.hpc_layer_name,
-        "-Z4",
-        "-z14",
-        "--extend-zooms-if-still-dropping",
-        "--drop-densest-as-needed",
-        str(hpc_points_path),
-    ]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except Exception as exc:
-        write_json(
-            root / cfg.paths.processed_dir / "hpc_sites_mbtiles_generation_note.json",
-            {
-                "status": "not_generated",
-                "reason": str(exc),
-                "source_geojson": str(hpc_points_path),
-                "target_mbtiles": str(mbtiles),
-            },
-        )
-    return mbtiles
-
-
-def write_run_metadata(cfg: AppConfig, root: Path) -> None:
+def write_run_metadata(cfg: AppConfig, root: Path, threshold_kw: float, stats_path: Path) -> None:
+    stats = read_json(stats_path) if stats_path.exists() else {}
     write_json(
-        root / cfg.paths.processed_dir / "run_metadata.json",
+        _processed_metadata_path(cfg, root, threshold_kw),
         {
             "completed_at": datetime.now(timezone.utc).isoformat(),
-            "subset_bbox": cfg.subset_bbox.model_dump(),
-            "min_power_kw": cfg.min_power_kw,
-            "sampling_interval_m": cfg.sampling_interval_m,
-            "directional_offset_m": cfg.directional_offset_m,
-            "preselection": cfg.preselection.model_dump(),
-            "color": cfg.color.model_dump(),
-            "routing_distance_mode": cfg.routing.distance_mode,
-            "routing_provider": cfg.routing.provider,
+            "min_power_kw": threshold_kw,
+            "distance_core": {
+                "graph_cache_path": cfg.distance_core.graph_cache_path,
+                "segment_length_m": cfg.distance_core.segment_length_m,
+                "road_class": cfg.distance_core.road_class,
+                "objective": cfg.distance_core.objective,
+                "drop_unsnappable": cfg.distance_core.drop_unsnappable,
+            },
+            "compute_stats": stats,
         },
     )
+
+
+def publish_default_aliases(cfg: AppConfig, root: Path, threshold_kw: float) -> None:
+    distance_mbtiles = _distance_mbtiles_path(cfg, root, threshold_kw)
+    if distance_mbtiles.exists():
+        shutil.copyfile(distance_mbtiles, root / cfg.tiles.distance_mbtiles_path)
+
+    shutil.copyfile(
+        _processed_geojson_path(cfg, root, "hpc_sites", threshold_kw),
+        _processed_geojson_path(cfg, root, "hpc_sites"),
+    )
+    shutil.copyfile(
+        _processed_geojson_path(cfg, root, "hpc_distance_segments", threshold_kw),
+        _processed_geojson_path(cfg, root, "hpc_distance_segments"),
+    )
+    shutil.copyfile(
+        _processed_metadata_path(cfg, root, threshold_kw),
+        _processed_metadata_path(cfg, root),
+    )
+
+
+def write_tileserver_config(cfg: AppConfig, root: Path) -> Path:
+    out_path = root / cfg.paths.processed_dir / "config.json"
+    data: dict[str, dict[str, str]] = {}
+    data[cfg.tiles.distance_layer_prefix] = {"mbtiles": Path(cfg.tiles.distance_mbtiles_path).name}
+    for threshold_kw in cfg.power_thresholds_kw():
+        token = _threshold_token(threshold_kw)
+        data[f"{cfg.tiles.distance_layer_prefix}_{token}"] = {
+            "mbtiles": _distance_mbtiles_path(cfg, root, threshold_kw).name
+        }
+
+    write_json(
+        out_path,
+        {
+            "options": {"paths": {"root": "/data"}},
+            "data": data,
+        },
+    )
+    return out_path

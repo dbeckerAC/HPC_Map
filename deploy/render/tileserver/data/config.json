@@ -1,0 +1,15 @@
+{
+  "options": {
+    "paths": {
+      "root": "/data"
+    }
+  },
+  "data": {
+    "hpc_distance": {
+      "mbtiles": "hpc_distance.mbtiles"
+    },
+    "hpc_distance_150": {
+      "mbtiles": "hpc_distance_150.mbtiles"
+    }
+  }
+}

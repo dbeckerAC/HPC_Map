@@ -118,6 +118,24 @@ body,
   color: var(--text);
 }
 
+#threshold-row {
+  margin: 0 0 12px;
+  display: grid;
+  gap: 6px;
+  font-size: 0.88rem;
+  color: var(--text);
+}
+
+#threshold-select {
+  width: 100%;
+  border: 1px solid #c8d2dd;
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--text);
+  font: inherit;
+  padding: 8px 10px;
+}
+
 #hpc-toggle {
   width: 16px;
   height: 16px;

@@ -15,3 +15,6 @@ data/raw/osm/
 hpc_map.egg-info/
 data/raw/bnetza/*.xlsx
 data/raw/bnetza/~$*.xlsx
+
+# distance-core artifacts
+distance-core/build/
