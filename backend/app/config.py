@@ -11,6 +11,13 @@ from pydantic import BaseModel, Field
 class AnalysisConfig(BaseModel):
     default_power_threshold_kw: Optional[float] = None
     power_thresholds_kw: list[float] = Field(default_factory=list)
+    autobahn_direct_hpc: "AutobahnDirectHpcConfig" = Field(default_factory=lambda: AutobahnDirectHpcConfig())
+
+
+class AutobahnDirectHpcConfig(BaseModel):
+    enabled: bool = False
+    min_power_kw: float = Field(default=150.0, gt=0)
+    max_distance_to_motorway_m: float = Field(default=1200.0, gt=0)
 
 
 class DistanceCoreConfig(BaseModel):
@@ -77,3 +84,9 @@ class AppConfig(BaseModel):
         if float(value).is_integer():
             return str(int(value))
         return str(value).replace(".", "p")
+
+    @staticmethod
+    def variant_token(value: float | str) -> str:
+        if isinstance(value, str):
+            return value
+        return AppConfig.threshold_token(float(value))

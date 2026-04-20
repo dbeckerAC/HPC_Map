@@ -26,34 +26,38 @@ def _threshold_token(value: float) -> str:
     return AppConfig.threshold_token(float(value))
 
 
-def _suffix_for_threshold(value: float) -> str:
-    return f"_{_threshold_token(value)}"
+def _variant_token(value: float | str) -> str:
+    return AppConfig.variant_token(value)
 
 
-def _intermediate_path(cfg: AppConfig, root: Path, stem: str, threshold_kw: float | None = None) -> Path:
-    suffix = _suffix_for_threshold(threshold_kw) if threshold_kw is not None else ""
+def _suffix_for_variant(variant: float | str | None = None) -> str:
+    return f"_{_variant_token(variant)}" if variant is not None else ""
+
+
+def _intermediate_path(cfg: AppConfig, root: Path, stem: str, variant: float | str | None = None) -> Path:
+    suffix = _suffix_for_variant(variant)
     return root / cfg.paths.intermediate_dir / f"{stem}{suffix}.json"
 
 
-def _processed_geojson_path(cfg: AppConfig, root: Path, stem: str, threshold_kw: float | None = None) -> Path:
-    suffix = _suffix_for_threshold(threshold_kw) if threshold_kw is not None else ""
+def _processed_geojson_path(cfg: AppConfig, root: Path, stem: str, variant: float | str | None = None) -> Path:
+    suffix = _suffix_for_variant(variant)
     return root / cfg.paths.processed_dir / f"{stem}{suffix}.geojson"
 
 
-def _processed_metadata_path(cfg: AppConfig, root: Path, threshold_kw: float | None = None) -> Path:
-    suffix = _suffix_for_threshold(threshold_kw) if threshold_kw is not None else ""
+def _processed_metadata_path(cfg: AppConfig, root: Path, variant: float | str | None = None) -> Path:
+    suffix = _suffix_for_variant(variant)
     return root / cfg.paths.processed_dir / f"run_metadata{suffix}.json"
 
 
-def _distance_mbtiles_path(cfg: AppConfig, root: Path, threshold_kw: float | None = None) -> Path:
-    if threshold_kw is None:
+def _distance_mbtiles_path(cfg: AppConfig, root: Path, variant: float | str | None = None) -> Path:
+    if variant is None:
         return root / cfg.tiles.distance_mbtiles_path
-    token = _threshold_token(threshold_kw)
+    token = _variant_token(variant)
     return root / cfg.paths.processed_dir / f"{cfg.tiles.distance_layer_prefix}_{token}.mbtiles"
 
 
-def _distance_core_stats_path(cfg: AppConfig, root: Path, threshold_kw: float) -> Path:
-    return _intermediate_path(cfg, root, "04_distance_core_stats", threshold_kw)
+def _distance_core_stats_path(cfg: AppConfig, root: Path, variant: float | str) -> Path:
+    return _intermediate_path(cfg, root, "04_distance_core_stats", variant)
 
 
 def _cluster_chargers_within_radius(chargers: list[dict[str, Any]], radius_m: float) -> list[dict[str, Any]]:
@@ -225,9 +229,16 @@ def stage_normalize_chargers(cfg: AppConfig, root: Path, threshold_kw: float) ->
     return out_path, checksum_path
 
 
-def stage_run_distance_core(cfg: AppConfig, root: Path, chargers_path: Path, threshold_kw: float) -> tuple[Path, Path]:
-    segments_path = _processed_geojson_path(cfg, root, "hpc_distance_segments", threshold_kw)
-    stats_path = _distance_core_stats_path(cfg, root, threshold_kw)
+def stage_run_distance_core(
+    cfg: AppConfig,
+    root: Path,
+    chargers_path: Path,
+    threshold_kw: float,
+    variant: float | str,
+    max_distance_to_motorway_m: float | None = None,
+) -> tuple[Path, Path]:
+    segments_path = _processed_geojson_path(cfg, root, "hpc_distance_segments", variant)
+    stats_path = _distance_core_stats_path(cfg, root, variant)
 
     if segments_path.exists() and stats_path.exists():
         existing = read_json(segments_path).get("features", [])
@@ -262,6 +273,8 @@ def stage_run_distance_core(cfg: AppConfig, root: Path, chargers_path: Path, thr
         "--out-stats-json",
         str(stats_path.resolve()),
     ]
+    if max_distance_to_motorway_m is not None:
+        cmd.extend(["--max-distance-to-motorway-m", str(float(max_distance_to_motorway_m))])
 
     try:
         proc = subprocess.run(cmd, cwd=root, check=False, capture_output=True, text=True)
@@ -284,9 +297,18 @@ def stage_run_distance_core(cfg: AppConfig, root: Path, chargers_path: Path, thr
     return segments_path, stats_path
 
 
-def stage_build_hpc_points_layer(cfg: AppConfig, root: Path, chargers_path: Path, threshold_kw: float) -> Path:
-    target = _processed_geojson_path(cfg, root, "hpc_sites", threshold_kw)
+def stage_build_hpc_points_layer(
+    cfg: AppConfig,
+    root: Path,
+    chargers_path: Path,
+    threshold_kw: float,
+    variant: float | str,
+    allowed_ids: set[str] | None = None,
+) -> Path:
+    target = _processed_geojson_path(cfg, root, "hpc_sites", variant)
     chargers = read_json(chargers_path).get("chargers", [])
+    if allowed_ids is not None:
+        chargers = [c for c in chargers if str(c.get("charger_id", "")) in allowed_ids]
     features = [
         {
             "type": "Feature",
@@ -307,8 +329,8 @@ def stage_build_hpc_points_layer(cfg: AppConfig, root: Path, chargers_path: Path
     return target
 
 
-def stage_generate_mbtiles(cfg: AppConfig, root: Path, segments_path: Path, threshold_kw: float) -> Path:
-    mbtiles = _distance_mbtiles_path(cfg, root, threshold_kw)
+def stage_generate_mbtiles(cfg: AppConfig, root: Path, segments_path: Path, variant: float | str) -> Path:
+    mbtiles = _distance_mbtiles_path(cfg, root, variant)
     ensure_dir(mbtiles.parent)
     cmd = [
         "tippecanoe",
@@ -339,10 +361,10 @@ def stage_generate_mbtiles(cfg: AppConfig, root: Path, segments_path: Path, thre
     return mbtiles
 
 
-def write_run_metadata(cfg: AppConfig, root: Path, threshold_kw: float, stats_path: Path) -> None:
+def write_run_metadata(cfg: AppConfig, root: Path, threshold_kw: float, variant: float | str, stats_path: Path) -> None:
     stats = read_json(stats_path) if stats_path.exists() else {}
     write_json(
-        _processed_metadata_path(cfg, root, threshold_kw),
+        _processed_metadata_path(cfg, root, variant),
         {
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "min_power_kw": threshold_kw,
@@ -385,6 +407,11 @@ def write_tileserver_config(cfg: AppConfig, root: Path) -> Path:
         token = _threshold_token(threshold_kw)
         data[f"{cfg.tiles.distance_layer_prefix}_{token}"] = {
             "mbtiles": _distance_mbtiles_path(cfg, root, threshold_kw).name
+        }
+    if cfg.analysis.autobahn_direct_hpc.enabled:
+        token = "autobahn_direct_hpc"
+        data[f"{cfg.tiles.distance_layer_prefix}_{token}"] = {
+            "mbtiles": _distance_mbtiles_path(cfg, root, token).name
         }
 
     write_json(

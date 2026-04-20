@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 from backend.app.config import AppConfig
+from pipeline.utils import read_json
 from pipeline.stages import (
     StageError,
     publish_default_aliases,
@@ -90,14 +91,16 @@ def run(config_path: Path, fresh: bool = False) -> None:
 
         segments, stats = _run_stage(
             f"distance_core_{token}",
-            lambda threshold_kw=threshold_kw: stage_run_distance_core(cfg, root, chargers, threshold_kw),
+            lambda threshold_kw=threshold_kw: stage_run_distance_core(
+                cfg, root, chargers, threshold_kw, threshold_kw
+            ),
         )
         _log(f"artifact {segments}")
         _log(f"artifact {stats}")
 
         hpc_sites = _run_stage(
             f"build_hpc_sites_layer_{token}",
-            lambda threshold_kw=threshold_kw: stage_build_hpc_points_layer(cfg, root, chargers, threshold_kw),
+            lambda threshold_kw=threshold_kw: stage_build_hpc_points_layer(cfg, root, chargers, threshold_kw, threshold_kw),
         )
         _log(f"artifact {hpc_sites}")
 
@@ -107,8 +110,56 @@ def run(config_path: Path, fresh: bool = False) -> None:
         )
         _log(f"artifact {dist_mb}")
 
-        write_run_metadata(cfg, root, threshold_kw, stats)
+        write_run_metadata(cfg, root, threshold_kw, threshold_kw, stats)
         _log(f"done  threshold {token}+ kW")
+
+    direct_cfg = cfg.analysis.autobahn_direct_hpc
+    if direct_cfg.enabled:
+        token = "autobahn_direct_hpc"
+        _log(f"start variant {token}")
+        threshold_kw = float(direct_cfg.min_power_kw)
+
+        chargers, _ = _run_stage(
+            f"normalize_chargers_{token}",
+            lambda threshold_kw=threshold_kw: stage_normalize_chargers(cfg, root, threshold_kw),
+        )
+        _log(f"artifact {chargers}")
+
+        segments, stats = _run_stage(
+            f"distance_core_{token}",
+            lambda threshold_kw=threshold_kw: stage_run_distance_core(
+                cfg,
+                root,
+                chargers,
+                threshold_kw,
+                token,
+                max_distance_to_motorway_m=float(direct_cfg.max_distance_to_motorway_m),
+            ),
+        )
+        _log(f"artifact {segments}")
+        _log(f"artifact {stats}")
+
+        hpc_sites = _run_stage(
+            f"build_hpc_sites_layer_{token}",
+            lambda threshold_kw=threshold_kw, stats=stats: stage_build_hpc_points_layer(
+                cfg,
+                root,
+                chargers,
+                threshold_kw,
+                token,
+                allowed_ids=set(read_json(stats).get("autobahn_direct_filter_kept_ids", [])),
+            ),
+        )
+        _log(f"artifact {hpc_sites}")
+
+        dist_mb = _run_stage(
+            f"generate_distance_mbtiles_{token}",
+            lambda: stage_generate_mbtiles(cfg, root, segments, token),
+        )
+        _log(f"artifact {dist_mb}")
+
+        write_run_metadata(cfg, root, threshold_kw, token, stats)
+        _log(f"done  variant {token}")
 
     publish_default_aliases(cfg, root, default_threshold)
     write_tileserver_config(cfg, root)

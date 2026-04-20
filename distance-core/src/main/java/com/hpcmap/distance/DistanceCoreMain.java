@@ -33,9 +33,11 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
+import java.util.Set;
 
 public final class DistanceCoreMain {
     private static final double INF = Double.POSITIVE_INFINITY;
@@ -69,20 +71,44 @@ public final class DistanceCoreMain {
         LocationIndex locationIndex = loadedGraph.locationIndex;
         try {
             final BooleanEncodedValue carAccessEnc;
+            final BooleanEncodedValue roadClassLinkEnc;
             final EnumEncodedValue<RoadClass> roadClassEnc;
             try {
                 carAccessEnc = encodingManager.getBooleanEncodedValue(VehicleAccess.key("car"));
+                roadClassLinkEnc = encodingManager.getBooleanEncodedValue("road_class_link");
                 roadClassEnc = encodingManager.getEnumEncodedValue(RoadClass.KEY, RoadClass.class);
             } catch (IllegalArgumentException exc) {
                 throw new IllegalStateException(
-                    "Graph cache is missing required encoded values (car_access/road_class). "
+                    "Graph cache is missing required encoded values (car_access/road_class/road_class_link). "
                         + "Re-import GraphHopper cache with updated config/graphhopper.yml.",
                     exc
                 );
             }
 
+            List<String> keptChargerIds = null;
+            if (args.maxDistanceToMotorwayM != null) {
+                List<Charger> filtered = filterChargersByMotorwayDistance(
+                    baseGraph,
+                    locationIndex,
+                    carAccessEnc,
+                    roadClassEnc,
+                    roadClassLinkEnc,
+                    chargers,
+                    args.maxDistanceToMotorwayM
+                );
+                if (filtered.isEmpty()) {
+                    throw new IllegalStateException(
+                        "No chargers remain after autobahn-direct filter (max_distance_to_motorway_m="
+                            + args.maxDistanceToMotorwayM + ")"
+                    );
+                }
+                chargers = filtered;
+                keptChargerIds = new ArrayList<>(chargers.size());
+                for (Charger charger : chargers) {
+                    keptChargerIds.add(charger.id);
+                }
+            }
             DijkstraResult result = computeDistanceField(baseGraph, locationIndex, carAccessEnc, chargers, args.dropUnsnappable);
-
             FeatureBuildResult features = buildMotorwaySegments(
                 baseGraph,
                 roadClassEnc,
@@ -112,6 +138,16 @@ public final class DistanceCoreMain {
             stats.put("total_nodes", baseGraph.getNodes());
             stats.put("motorway_edges", features.motorwayEdges);
             stats.put("segments", features.segments);
+            if (args.maxDistanceToMotorwayM != null) {
+                stats.put("autobahn_direct_filter_max_distance_m", args.maxDistanceToMotorwayM);
+                stats.put("chargers_after_autobahn_direct_filter", chargers.size());
+                ArrayNode kept = stats.putArray("autobahn_direct_filter_kept_ids");
+                if (keptChargerIds != null) {
+                    for (String id : keptChargerIds) {
+                        kept.add(id);
+                    }
+                }
+            }
             mapper.writerWithDefaultPrettyPrinter().writeValue(args.outStatsJson.toFile(), stats);
         } finally {
             loadedGraph.close();
@@ -164,6 +200,7 @@ public final class DistanceCoreMain {
         System.out.println("  DistanceCoreMain --graph-cache <path> --chargers-json <path> --threshold-kw <n>");
         System.out.println("                   --segment-length-m <n> --road-class MOTORWAY --objective distance");
         System.out.println("                   --drop-unsnappable true|false");
+        System.out.println("                   [--max-distance-to-motorway-m <n>]");
         System.out.println("                   --out-segments-geojson <path> --out-stats-json <path>");
     }
 
@@ -363,6 +400,93 @@ public final class DistanceCoreMain {
         }
 
         return new DijkstraResult(distM, nearestSeedId, seedCount, unsnappable, reachable);
+    }
+
+    private static List<Charger> filterChargersByMotorwayDistance(
+        BaseGraph graph,
+        LocationIndex locationIndex,
+        BooleanEncodedValue carAccessEnc,
+        EnumEncodedValue<RoadClass> roadClassEnc,
+        BooleanEncodedValue roadClassLinkEnc,
+        List<Charger> chargers,
+        double maxDistanceToMotorwayM
+    ) {
+        double[] distToMotorwayM = computeDistanceToMotorway(graph, carAccessEnc, roadClassEnc, roadClassLinkEnc);
+        List<Charger> out = new ArrayList<>();
+        for (Charger charger : chargers) {
+            Snap snap = locationIndex.findClosest(charger.lat, charger.lon, AccessFilter.allEdges(carAccessEnc));
+            if (!snap.isValid()) {
+                continue;
+            }
+            int node = snap.getClosestNode();
+            if (node < 0 || node >= distToMotorwayM.length) {
+                continue;
+            }
+            double d = distToMotorwayM[node];
+            if (Double.isFinite(d) && d <= maxDistanceToMotorwayM) {
+                out.add(charger);
+            }
+        }
+        out.sort(Comparator.comparing(c -> c.id));
+        return out;
+    }
+
+    private static double[] computeDistanceToMotorway(
+        BaseGraph graph,
+        BooleanEncodedValue carAccessEnc,
+        EnumEncodedValue<RoadClass> roadClassEnc,
+        BooleanEncodedValue roadClassLinkEnc
+    ) {
+        int nodes = graph.getNodes();
+        double[] distM = new double[nodes];
+        Arrays.fill(distM, INF);
+
+        Set<Integer> motorwayNodes = new HashSet<>();
+        AllEdgesIterator all = graph.getAllEdges();
+        while (all.next()) {
+            RoadClass rc = all.get(roadClassEnc);
+            if (rc != RoadClass.MOTORWAY && !all.get(roadClassLinkEnc)) {
+                continue;
+            }
+            motorwayNodes.add(all.getBaseNode());
+            motorwayNodes.add(all.getAdjNode());
+        }
+
+        PriorityQueue<NodeState> pq = new PriorityQueue<>(Comparator
+            .comparingDouble((NodeState s) -> s.distM)
+            .thenComparing(s -> s.seedId));
+        for (int node : motorwayNodes) {
+            if (node < 0 || node >= nodes) {
+                continue;
+            }
+            distM[node] = 0.0;
+            pq.add(new NodeState(node, 0.0, "motorway"));
+        }
+
+        EdgeExplorer explorer = graph.createEdgeExplorer();
+        while (!pq.isEmpty()) {
+            NodeState curr = pq.poll();
+            if (curr.distM > distM[curr.node] + 1e-9) {
+                continue;
+            }
+            EdgeIterator iter = explorer.setBaseNode(curr.node);
+            while (iter.next()) {
+                if (!iter.get(carAccessEnc)) {
+                    continue;
+                }
+                int adj = iter.getAdjNode();
+                if (adj < 0 || adj >= nodes) {
+                    continue;
+                }
+                double nextDist = curr.distM + iter.getDistance();
+                if (nextDist + 1e-9 < distM[adj]) {
+                    distM[adj] = nextDist;
+                    pq.add(new NodeState(adj, nextDist, "motorway"));
+                }
+            }
+        }
+
+        return distM;
     }
 
     private static FeatureBuildResult buildMotorwaySegments(
@@ -666,6 +790,7 @@ public final class DistanceCoreMain {
         private final String objective;
         private final RoadClass roadClass;
         private final boolean dropUnsnappable;
+        private final Double maxDistanceToMotorwayM;
         private final Path outSegmentsGeoJson;
         private final Path outStatsJson;
 
@@ -677,6 +802,7 @@ public final class DistanceCoreMain {
             String objective,
             RoadClass roadClass,
             boolean dropUnsnappable,
+            Double maxDistanceToMotorwayM,
             Path outSegmentsGeoJson,
             Path outStatsJson
         ) {
@@ -687,6 +813,7 @@ public final class DistanceCoreMain {
             this.objective = objective;
             this.roadClass = roadClass;
             this.dropUnsnappable = dropUnsnappable;
+            this.maxDistanceToMotorwayM = maxDistanceToMotorwayM;
             this.outSegmentsGeoJson = outSegmentsGeoJson;
             this.outStatsJson = outStatsJson;
         }
@@ -717,6 +844,9 @@ public final class DistanceCoreMain {
             RoadClass roadClass = RoadClass.valueOf(roadClassRaw);
 
             boolean dropUnsnappable = Boolean.parseBoolean(map.getOrDefault("--drop-unsnappable", "true"));
+            Double maxDistanceToMotorwayM = map.containsKey("--max-distance-to-motorway-m")
+                ? Double.parseDouble(required(map, "--max-distance-to-motorway-m"))
+                : null;
             Path outSegmentsGeoJson = Path.of(required(map, "--out-segments-geojson"));
             Path outStatsJson = Path.of(required(map, "--out-stats-json"));
 
@@ -728,6 +858,7 @@ public final class DistanceCoreMain {
                 "distance",
                 roadClass,
                 dropUnsnappable,
+                maxDistanceToMotorwayM,
                 outSegmentsGeoJson,
                 outStatsJson
             );

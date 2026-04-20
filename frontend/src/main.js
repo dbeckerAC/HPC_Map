@@ -70,21 +70,41 @@ function buildThresholdVariants(config) {
   const defaultThreshold = thresholdToken(
     analysis.default_power_threshold_kw ?? config.min_power_kw ?? thresholds[0]
   );
+  const variants = thresholds.map((value) => {
+    const token = thresholdToken(value);
+    return {
+      id: token,
+      numericValue: Number(value),
+      label: `${value}+ kW`,
+      distanceSource: `distance-${token}`,
+      distanceLayer,
+      hpcSource: `hpc-${token}`,
+      hpcHighlightSource: `hpc-highlight-${token}`,
+      hpcGeojson: `${API_BASE}/layers/${hpcPrefix}_${token}.geojson`,
+      tiles: [`${TILESERVER_BASE}/data/${distancePrefix}_${token}/{z}/{x}/{y}.pbf`]
+    };
+  });
+
+  const direct = analysis.autobahn_direct_hpc || {};
+  if (direct.enabled) {
+    const token = "autobahn_direct_hpc";
+    const minPower = Number(direct.min_power_kw ?? config.min_power_kw ?? 150);
+    variants.push({
+      id: token,
+      numericValue: minPower,
+      label: `Autobahn-direct HPC (${minPower}+ kW)`,
+      distanceSource: `distance-${token}`,
+      distanceLayer,
+      hpcSource: `hpc-${token}`,
+      hpcHighlightSource: `hpc-highlight-${token}`,
+      hpcGeojson: `${API_BASE}/layers/${hpcPrefix}_${token}.geojson`,
+      tiles: [`${TILESERVER_BASE}/data/${distancePrefix}_${token}/{z}/{x}/{y}.pbf`]
+    });
+  }
+
   return {
     defaultThreshold,
-    variants: thresholds.map((value) => {
-      const token = thresholdToken(value);
-      return {
-        id: token,
-        numericValue: Number(value),
-        label: `${value}+ kW`,
-        distanceSource: `distance-${token}`,
-        distanceLayer,
-        hpcSource: `hpc-${token}`,
-        hpcGeojson: `${API_BASE}/layers/${hpcPrefix}_${token}.geojson`,
-        tiles: [`${TILESERVER_BASE}/data/${distancePrefix}_${token}/{z}/{x}/{y}.pbf`]
-      };
-    })
+    variants
   };
 }
 
@@ -110,7 +130,12 @@ function distanceLayerIds(variant) {
 }
 
 function hpcLayerIds(variant) {
-  return [`hpc-clusters-${variant.id}`, `hpc-cluster-count-${variant.id}`, `hpc-sites-${variant.id}`];
+  return [
+    `hpc-clusters-${variant.id}`,
+    `hpc-cluster-count-${variant.id}`,
+    `hpc-sites-${variant.id}`,
+    `hpc-nearest-highlight-${variant.id}`
+  ];
 }
 
 function addDistanceLayer(variant) {
@@ -214,6 +239,21 @@ function addHpcLayer(variant) {
       "circle-stroke-width": 0.9
     }
   });
+
+  map.addLayer({
+    id: `hpc-nearest-highlight-${variant.id}`,
+    type: "circle",
+    source: variant.hpcHighlightSource,
+    minzoom: 5,
+    filter: ["==", ["get", "charger_id"], "__none__"],
+    paint: {
+      "circle-radius": ["interpolate", ["linear"], ["zoom"], 5, 7, 10, 10, 14, 13],
+      "circle-color": "#f59e0b",
+      "circle-opacity": 0.95,
+      "circle-stroke-color": "#ffffff",
+      "circle-stroke-width": 2.0
+    }
+  });
 }
 
 function setLayerVisibility(layerIds, visibility) {
@@ -229,7 +269,11 @@ function applyActiveThreshold() {
   for (const variant of thresholdVariants) {
     const active = variant.id === activeThreshold;
     setLayerVisibility(distanceLayerIds(variant), active ? "visible" : "none");
-    setLayerVisibility(hpcLayerIds(variant), active && showHpc ? "visible" : "none");
+    setLayerVisibility(
+      [`hpc-clusters-${variant.id}`, `hpc-cluster-count-${variant.id}`, `hpc-sites-${variant.id}`],
+      active && showHpc ? "visible" : "none"
+    );
+    setLayerVisibility([`hpc-nearest-highlight-${variant.id}`], active ? "visible" : "none");
   }
   const label = thresholdVariants.find((variant) => variant.id === activeThreshold)?.label || `${activeThreshold}+ kW`;
   hoverEl.textContent = `Hover a motorway segment | active threshold: ${label}`;
@@ -242,11 +286,18 @@ function bindHoverEventsForVariant(variant) {
     const start = Number(feature.properties?.distance_start_km ?? NaN);
     const end = Number(feature.properties?.distance_end_km ?? NaN);
     const minPower = feature.properties?.min_power_kw ?? `${variant.numericValue}+`;
+    const nearestHpcId = feature.properties?.nearest_hpc_id ?? "n/a";
     const avg = Number.isFinite(start) && Number.isFinite(end) ? ((start + end) / 2).toFixed(2) : "n/a";
-    hoverEl.textContent = `Distance: ${avg} km | threshold: ${minPower} kW`;
+    hoverEl.textContent = `Distance: ${avg} km | threshold: ${minPower} kW | nearest HPC: ${nearestHpcId}`;
+    if (nearestHpcId && nearestHpcId !== "n/a" && map.getLayer(`hpc-nearest-highlight-${variant.id}`)) {
+      map.setFilter(`hpc-nearest-highlight-${variant.id}`, ["==", ["get", "charger_id"], String(nearestHpcId)]);
+    }
   });
 
   map.on("mouseleave", `hpc-distance-${variant.id}`, () => {
+    if (map.getLayer(`hpc-nearest-highlight-${variant.id}`)) {
+      map.setFilter(`hpc-nearest-highlight-${variant.id}`, ["==", ["get", "charger_id"], "__none__"]);
+    }
     hoverEl.textContent = "Hover a motorway segment";
   });
 
@@ -322,6 +373,10 @@ map.on("load", async () => {
         cluster: true,
         clusterRadius: 42,
         clusterMaxZoom: 8
+      });
+      map.addSource(variant.hpcHighlightSource, {
+        type: "geojson",
+        data: variant.hpcGeojson
       });
       addDistanceLayer(variant);
       addHpcLayer(variant);
