@@ -1,5 +1,5 @@
 {
-  "completed_at": "2026-04-20T18:59:27.108374+00:00",
+  "completed_at": "2026-04-20T19:33:12.528842+00:00",
   "min_power_kw": 150.0,
   "distance_core": {
     "graph_cache_path": "tools/graphhopper/graph-cache",

@@ -8,8 +8,17 @@
     "hpc_distance": {
       "mbtiles": "hpc_distance.mbtiles"
     },
+    "hpc_distance_100": {
+      "mbtiles": "hpc_distance_100.mbtiles"
+    },
     "hpc_distance_150": {
       "mbtiles": "hpc_distance_150.mbtiles"
+    },
+    "hpc_distance_250": {
+      "mbtiles": "hpc_distance_250.mbtiles"
+    },
+    "hpc_distance_autobahn_direct_hpc": {
+      "mbtiles": "hpc_distance_autobahn_direct_hpc.mbtiles"
     }
   }
 }

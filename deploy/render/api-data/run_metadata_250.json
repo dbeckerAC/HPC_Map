@@ -1,0 +1,27 @@
+{
+  "completed_at": "2026-04-20T19:33:37.254317+00:00",
+  "min_power_kw": 250.0,
+  "distance_core": {
+    "graph_cache_path": "tools/graphhopper/graph-cache",
+    "segment_length_m": 250.0,
+    "road_class": "MOTORWAY",
+    "objective": "distance",
+    "drop_unsnappable": true
+  },
+  "compute_stats": {
+    "generated_at": "2026-04-20T19:21:12.961822841Z",
+    "graph_cache": "/app/tools/graphhopper/graph-cache",
+    "objective": "distance",
+    "road_class": "MOTORWAY",
+    "threshold_kw": 250.0,
+    "segment_length_m": 250.0,
+    "chargers_loaded": 4577,
+    "chargers_after_50m_dedupe": 4577,
+    "seed_nodes": 4569,
+    "unsnappable_chargers": 1,
+    "reachable_nodes": 13738725,
+    "total_nodes": 17257299,
+    "motorway_edges": 119257,
+    "segments": 199613
+  }
+}
