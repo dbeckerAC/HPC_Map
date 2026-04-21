@@ -10,6 +10,7 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 tools/graphhopper/
+!tools/graphhopper/README.md
 data/raw/osm/
 .venv/
 hpc_map.egg-info/
