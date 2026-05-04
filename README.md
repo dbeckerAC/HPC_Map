@@ -58,6 +58,27 @@ Docker:
 docker compose run --rm pipeline
 ```
 
+## Prepare Render Deploy
+
+After pipeline output exists in `data/processed`, stage deploy artifacts for Render:
+
+```bash
+bash deploy/prepare_render_assets.sh
+```
+
+This copies current outputs into:
+
+- `deploy/render/tileserver/data` (MBTiles + optional `config.json`)
+- `deploy/render/api-data` (HPC GeoJSON + run metadata)
+
+Before pushing, verify and commit staged deploy files:
+
+```bash
+git status -- deploy/render/tileserver/data deploy/render/api-data
+```
+
+Render service definitions are in `render.yaml`.
+
 ## Start App Stack
 
 ```bash
